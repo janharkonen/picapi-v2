@@ -6,11 +6,14 @@ import (
 	"io"
 	"mime"
 	"path"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
+
+const presignLifetime = 15 * time.Minute
 
 func newS3Client(cfg S3Config) *s3.Client {
 	return s3.New(s3.Options{
@@ -63,4 +66,21 @@ func fetchObject(ctx context.Context, client *s3.Client, bucket, key string) (st
 
 func contentTypeForKey(key string) string {
 	return mime.TypeByExtension(path.Ext(key))
+}
+
+func presignGetObjectURL(ctx context.Context, client *s3.Client, bucket, key string) (string, error) {
+	input := &s3.GetObjectInput{
+		Bucket:                     aws.String(bucket),
+		Key:                        aws.String(key),
+		ResponseContentDisposition: aws.String("inline"),
+	}
+	if contentType := contentTypeForKey(key); contentType != "" {
+		input.ResponseContentType = aws.String(contentType)
+	}
+
+	presigned, err := s3.NewPresignClient(client).PresignGetObject(ctx, input, s3.WithPresignExpires(presignLifetime))
+	if err != nil {
+		return "", fmt.Errorf("presign get object %q: %w", key, err)
+	}
+	return presigned.URL, nil
 }

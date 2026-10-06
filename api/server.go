@@ -53,6 +53,19 @@ func main() {
 		return c.Stream(http.StatusOK, obj.ContentType, obj.Body)
 	})
 
+	e.GET("/image_redirect", func(c *echo.Context) error {
+		objectKey := "dev/00000040052441_A1N1.png"
+		url, err := presignGetObjectURL(c.Request().Context(), s3client, s3cfg.Bucket, objectKey)
+		if err != nil {
+			c.Logger().Error("failed to presign image", "error", err, "key", objectKey)
+			return echo.NewHTTPError(http.StatusBadGateway, "failed to presign image")
+		}
+
+		// Do not cache the redirect. The presigned URL expires.
+		c.Response().Header().Set("Cache-Control", "no-store")
+		return c.Redirect(http.StatusFound, url)
+	})
+
 	// Start server
 	sc := echo.StartConfig{Address: ":1323"}
 	if err := sc.Start(context.Background(), e); err != nil {
