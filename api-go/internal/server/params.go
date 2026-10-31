@@ -1,6 +1,6 @@
 // Transform parameters: parsing, presets, canonical form, resolution, signing.
 
-package main
+package server
 
 import (
 	"crypto/hmac"

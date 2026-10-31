@@ -1,4 +1,4 @@
-package main
+package server
 
 import (
 	"crypto/rand"
@@ -14,16 +14,21 @@ const idLength = 12
 var idPattern = regexp.MustCompile(`^[0-9A-Za-z]{12}$`)
 
 func newID() string {
+	return randomString(idLength)
+}
+
+// randomString returns n characters of base62 from crypto/rand.
+func randomString(n int) string {
 	max := big.NewInt(int64(len(idAlphabet)))
-	id := make([]byte, idLength)
-	for i := range id {
-		n, err := rand.Int(rand.Reader, max)
+	out := make([]byte, n)
+	for i := range out {
+		v, err := rand.Int(rand.Reader, max)
 		if err != nil {
 			panic(err)
 		}
-		id[i] = idAlphabet[n.Int64()]
+		out[i] = idAlphabet[v.Int64()]
 	}
-	return string(id)
+	return string(out)
 }
 
 func isValidID(id string) bool {

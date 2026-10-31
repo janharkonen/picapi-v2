@@ -1,4 +1,4 @@
-package main
+package server
 
 import (
 	"bytes"
@@ -111,6 +111,28 @@ func (s *Storage) delete(ctx context.Context, key string) error {
 		return fmt.Errorf("delete object %q: %w", key, err)
 	}
 	return nil
+}
+
+func (s *Storage) listKeys(ctx context.Context, prefix string) ([]string, error) {
+	var keys []string
+	pages := s3.NewListObjectsV2Paginator(s.client, &s3.ListObjectsV2Input{
+		Bucket: aws.String(s.bucket),
+		Prefix: aws.String(prefix),
+	})
+	for pages.HasMorePages() {
+		page, err := pages.NextPage(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("list objects %q: %w", prefix, err)
+		}
+		for _, obj := range page.Contents {
+			keys = append(keys, aws.ToString(obj.Key))
+		}
+	}
+	return keys, nil
+}
+
+func (s *Storage) maskKey(id, model, transformVersion string) string {
+	return s.variantPrefix(id) + "mask-" + model + "-v" + transformVersion + ".png"
 }
 
 // deletePrefix deletes objects one by one; DeleteObjects needs Content-MD5, which some providers handle poorly.

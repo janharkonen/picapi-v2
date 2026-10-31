@@ -1,7 +1,5 @@
 # picapi v2 — Architecture
 
-Status: draft, under discussion. Nothing here is final until it is implemented.
-
 ## Goals
 
 - Upload an image (later: any document) and get a short, permanent URL for it.
@@ -20,59 +18,80 @@ Status: draft, under discussion. Nothing here is final until it is implemented.
 ## Overview
 
 ```
-                       ┌──────────────────────────── Railway ───────────────────────────┐
-browser / <img> ──▶ Cloudflare CDN ──miss──▶ picapi (Go) ──▶ S3-compatible bucket (private)
-                    (edge cache)            │  ├─ libvips (govips)                      │
-CLI / MCP / UI ─────────────────────────────▶  ├─ ONNX Runtime (background removal)     │
-                                            │  └─ SQLite (metadata, on a volume)        │
-                       └────────────────────────────────────────────────────────────────┘
+                       ┌───────────────────────────── Railway ─────────────────────────────┐
+browser / <img> ──▶ Cloudflare CDN ──miss──▶ picapi-server (Go) ──▶ Railway Bucket (private, S3)
+                    (edge cache)            │  ├─ libvips (govips)                          │
+CLI / MCP / UI ─────────────────────────────▶  ├─ ONNX Runtime (background removal)         │
+                                            │  └──────────────▶ Postgres (metadata)         │
+                       └───────────────────────────────────────────────────────────────────┘
 ```
 
-- **picapi** is a single Go service. It runs the HTTP API and the MCP endpoint, and it serves the embedded web UI.
-- **Object storage** is any S3-compatible bucket and is always private. The reference deployment uses a Railway Bucket.
+- **picapi-server** is a single Go service. It runs the management API and the MCP endpoint, delivers images, and serves the embedded web UI.
+- **Object storage** is any S3-compatible bucket and is always private.
+- **Postgres** holds metadata and is the source of truth for which assets exist. The server is stateless: no volume, and it can be redeployed freely.
 - **Cloudflare** sits in front of the public hostname as a reverse proxy/CDN, with the DNS record proxied (orange cloud). It is the cache users actually hit.
-- **SQLite** holds metadata and is the source of truth for which assets exist. Postgres is an optional alternative.
+- **picapi** (CLI) is a separate, pure-Go binary that talks to the HTTP API. It needs no cgo or libvips, so it builds as a single static file.
 
 ## Tech stack
 
 | Concern | Choice | Notes |
 |---|---|---|
-| Language | Go | Single static binary for the CLI. Good concurrency and low memory for the server. |
-| HTTP | Echo v5 | Already in use. |
-| Image processing | libvips via `govips` | Fast and streaming, with JPEG/PNG/WebP/AVIF/HEIC/GIF support. Requires cgo. |
-| Background removal | ONNX Runtime via `yalue/onnxruntime_go` | Same models rembg uses. Pre- and post-processing are ported to Go. |
-| Metadata | SQLite (`modernc.org/sqlite`) | Optional `DATABASE_URL` for Postgres. |
-| Object storage | `aws-sdk-go-v2` S3 client | Path-style addressing by default. Checksums are only sent when required (R2 compatibility). |
-| MCP | Official MCP Go SDK | Served by the API at `/mcp`. |
-| Web UI | Vanilla JS, embedded with `embed.FS` | No separate frontend deployment. |
-| Packaging | Docker image | Contains libvips, ONNX Runtime and the default model. A `-slim` tag without ML is possible later. |
+| Language | Go | |
+| HTTP | Echo v5 | |
+| Image processing | libvips via `govips` | Shrink-on-load, smart crop, JPEG/PNG/WebP/AVIF/GIF. Requires cgo. |
+| Background removal | ONNX Runtime 1.31 via `yalue/onnxruntime_go` | Same models and pre/post-processing as rembg, ported to Go. |
+| Metadata | Postgres via `pgx/v5` | Migrations are embedded SQL files, applied at startup under an advisory lock. |
+| Object storage | `aws-sdk-go-v2` S3 client | Checksums are only sent when required (R2 compatibility). |
+| MCP | Official MCP Go SDK | Streamable HTTP at `/mcp`, stateless. |
+| Web UI | Vanilla JS, embedded with `embed.FS` | Served at `/`. |
+| Packaging | Docker image | libvips, ONNX Runtime and both models are baked in. Contains `picapi-server` and `picapi`. |
+
+### Code layout
+
+```
+api-go/
+  cmd/picapi-server/   server entry point
+  cmd/picapi/          CLI (CGO_ENABLED=0)
+  internal/server/     HTTP API, delivery, transforms, background removal, MCP, UI, maintenance
+  internal/server/migrations/   Postgres schema
+  internal/server/ui/  web UI (HTML, CSS, JS)
+  internal/client/     HTTP client used by the CLI
+  Dockerfile           build context is the repository root
+conformance/           black-box HTTP test suite
+docker-compose.yml     local SeaweedFS (S3) + Postgres + server
+```
 
 ### Background-removal models
 
-Only permissively licensed models are shipped or downloaded by default:
+Only permissively licensed models are shipped. Both are in the Docker image.
 
 | `BG_MODEL` | License | Size | Notes |
 |---|---|---|---|
-| `u2netp` | Apache-2.0 | ~4 MB | Fast; for small instances. |
-| `isnet` (default) | Apache-2.0 | ~170 MB | Good general quality. |
-| `birefnet` | MIT | ~900 MB | Best quality; needs more RAM and CPU. |
-| `off` | — | — | Disables `bg=remove`. |
+| `isnet` (default) | Apache-2.0 | ~170 MB | IS-Net general use, 1024×1024 input. Good quality; about 3 s per image on a small Railway instance. |
+| `u2netp` | Apache-2.0 | ~4.5 MB | 320×320 input. Fast, lower quality; used for local development. |
+| `off` | — | — | `bg_remove` returns 501. |
 
-BRIA RMBG models are **not** supported by default because their license is non-commercial.
+BRIA RMBG models are not supported because their license is non-commercial. BiRefNet (MIT) may be added later.
+
+The model and ONNX Runtime load on the first background removal, so servers that never use it don't pay the memory. At most `BG_CONCURRENCY` (default 1) model runs happen at once.
 
 ## Delivery and caching
 
-The Go API always streams the bytes (proxy mode). Cloudflare caches the responses.
+The Go server always streams the bytes (proxy mode). Cloudflare caches the responses.
 
 ### Request flow
 
 1. A browser requests `https://img.example.com/i/{id}/w_320,f_webp`.
 2. On a Cloudflare **hit**, the edge serves the response and picapi is never contacted. It costs nothing.
 3. On a **miss**, Cloudflare forwards the request to picapi, which then:
-   1. looks up `{id}` in SQLite (404 if missing or deleted; auth check if private),
+   1. looks up `{id}` in Postgres (404 if missing or deleted; auth check if private),
    2. looks for the variant in `cached/` in the bucket and streams it if it exists,
    3. otherwise reads the original from the bucket, transforms it with libvips, streams the result, and writes it to `cached/` in the background.
 4. Cloudflare stores the response according to `Cache-Control`.
+
+Concurrent requests for the same variant share one render (`singleflight`), and at most `TRANSFORM_CONCURRENCY` renders run at once.
+
+Every delivery response carries debug headers: `X-Picapi-Variant` (variant hash), `X-Picapi-Cache` (`hit` from the bucket, or `miss`), and on misses `Server-Timing: transform;dur=<ms>`.
 
 ### Costs on Railway
 
@@ -91,9 +110,9 @@ Cloudflare's cache is not durable storage:
 Without `cached/`, every one of those misses means reading the full original (possibly many MB) and transforming it again. Storing a variant costs about $0.015/GB-month plus a one-time upload, so the bucket cache is cheap insurance.
 
 - It is a second-level cache: Cloudflare first, then `cached/`, then transforming the original.
-- It is required for background-removal **masks**, because those cost seconds of CPU to compute.
-- It can be turned off for other variants with `VARIANT_STORE=off`.
-- A periodic janitor deletes variants that haven't been read for `VARIANT_TTL` (default 30 days). Last access is tracked in SQLite, since not every provider supports lifecycle rules.
+- Background-removal **masks** are always stored, because they cost seconds of CPU to compute.
+- Other variants can be turned off with `VARIANT_STORE=off`.
+- A janitor runs every `JANITOR_INTERVAL` (default 1 h) and deletes variants that haven't been read for `VARIANT_TTL` (default 30 days). Last access is tracked in Postgres, since not every provider supports lifecycle rules.
 
 ### Cache headers
 
@@ -102,90 +121,63 @@ Because assets are immutable, every public delivery URL is cached forever.
 | Response | `Cache-Control` |
 |---|---|
 | Public asset or variant | `public, max-age=31536000, immutable` + `ETag` |
-| Private asset | `private, max-age=<seconds until token exp>` (never stored by Cloudflare) |
-| Redirect to canonical URL | `public, max-age=31536000` |
+| Public, signed URL with `exp` | `public, max-age=<seconds until exp>` |
+| Private asset with a view token | `private, max-age=<seconds until token exp>` (never stored by Cloudflare) |
+| Private asset seen through the web UI's session cookie | `private, max-age=300` |
+| Redirect to canonical URL | `public, max-age=31536000` (private assets: `no-store`) |
 | Errors | `no-store` |
 
 ### Canonical URLs and purging
 
-The same variant can be written several ways (query vs path form, parameter order, `w_320` vs `w_320,q_80` when 80 is the default). To keep exactly one cached copy per variant:
+The same variant can be written several ways (query vs path form, parameter order). To keep exactly one cached copy per URL form:
 
-- picapi normalizes the parameters and, if the request isn't already in canonical form, answers with a `301` to the canonical path. Clients (UI, CLI, MCP) always generate canonical URLs, so the redirect is rare.
-- Every canonical URL that picapi serves is recorded in the `variants` table, even when `VARIANT_STORE=off`.
+- picapi parses the parameters and, if the request isn't already in canonical form, answers with a `301` to the canonical path. Canonical form is the path form with keys in a fixed order (`p, w, h, fit, g, f, q, dpr, up, bg, bgc`) and the query reduced to `exp`, `s`, `token`. Clients (UI, CLI, MCP) always generate canonical URLs, so the redirect is rare.
+- Every public URL picapi serves with a long cache lifetime is recorded in `served_urls` (once per process per URL).
 
-The only times cached copies must go away are **delete** and **public → private**. picapi then purges every recorded URL of the asset through the Cloudflare API, in batches (`CLOUDFLARE_ZONE_ID`, `CLOUDFLARE_API_TOKEN`). Without Cloudflare credentials, deleted or now-private images can stay visible at the edge until Cloudflare evicts them. The UI warns about this.
+The only times cached copies must go away are **delete** and **public → private**. picapi then purges every recorded URL of the asset through the Cloudflare API, in batches of 30 (`CLOUDFLARE_ZONE_ID`, `CLOUDFLARE_API_TOKEN`). Without Cloudflare credentials, deleted or now-private images can stay visible at the edge until Cloudflare evicts them.
 
-### Cloudflare setup (documented for users)
+### Cloudflare setup
 
-- Make the DNS record for the image hostname **proxied** (orange cloud), pointing to the Railway service.
-- Add a Cache Rule: hostname = image host and path starts with `/i/` → *Eligible for cache*, *respect origin Cache-Control*, and include the query string in the cache key.
+- Make the DNS record for the image hostname **proxied** (orange cloud), pointing to the Railway service. SSL/TLS mode must be *Full* (Railway serves HTTPS).
+- Add a Cache Rule: hostname equals the image host and URI path starts with `/i/` → *Eligible for cache*, edge TTL *use cache-control header if present*, browser TTL *respect origin*. Cloudflare's default cache key includes the full query string, which signed URLs need.
 - Turn on Tiered Cache (available on the free plan).
-- Do not use `f_auto` behind Cloudflare. The free plan ignores `Vary: Accept`, so one format would be served to every browser. Use explicit formats, and `<picture>` when you want to offer several.
+- `f_auto` is deliberately not offered: the free plan ignores `Vary: Accept`, so one format would be served to every browser. Use explicit formats, and `<picture>` to offer several.
+- For purging, create a token with only *Zone → Cache Purge → Purge* and set `CLOUDFLARE_ZONE_ID` and `CLOUDFLARE_API_TOKEN`.
 
 ## Storage layout
 
 One private bucket. `S3_ENV_PREFIX` (optional) is prepended to every key so several environments can share one bucket.
 
 ```
-{prefix}originals/{id}                  original bytes, never overwritten
-{prefix}cached/{id}/{hash}.{ext}        transformed variants
-{prefix}cached/{id}/mask.png            background-removal alpha mask
+{prefix}originals/{id}                             original bytes, never overwritten
+{prefix}cached/{id}/{hash}.{ext}                   transformed variants
+{prefix}cached/{id}/mask-{model}-v{version}.png    background-removal alpha mask
 ```
 
 - `{id}`: 12 characters of base62 (`0-9A-Za-z`) from `crypto/rand`, about 71 bits of randomness. It is never reused, so a deleted ID can't later point at different content that an old cache still holds.
   - Why not ULID: a ULID is 26 characters and embeds the upload timestamp in every public URL. Its only advantage, sorting by time, is already covered by the `created_at` column.
-  - Collisions are practically impossible at this size, but an insert that hits the primary key retries with a new ID anyway.
-- `{hash}`: hash of the **normalized** transform parameters plus `TRANSFORM_VERSION`. Bumping `TRANSFORM_VERSION` (e.g. after an encoder change) invalidates every stored variant without touching originals. The public URL doesn't change, so Cloudflare keeps serving the old bytes until they are evicted or purged. That's acceptable, because the old variant is still a correct rendering of the same image.
-- The original's essential metadata (`id`, filename, content type) is also written as S3 object metadata (`x-amz-meta-*`). The database can then be rebuilt from the bucket alone.
+- `{hash}`: first 32 hex characters of SHA-256 over `TRANSFORM_VERSION`, the asset ID and the fully resolved parameters (presets expanded, defaults filled in). Bumping `TRANSFORM_VERSION` (e.g. after an encoder change) invalidates every stored variant and mask without touching originals. The public URL doesn't change, so Cloudflare keeps serving the old bytes until they are evicted or purged. That's acceptable, because the old variant is still a correct rendering of the same image.
+- The original's ID and filename are also written as S3 object metadata (`x-amz-meta-picapi-*`).
 
-## Metadata (SQLite)
+## Metadata (Postgres)
 
-The database is the source of truth for what exists; the bucket is the source of truth for bytes.
+The database is the source of truth for what exists; the bucket is the source of truth for bytes. The schema lives in `api-go/internal/server/migrations/`.
 
-```sql
-CREATE TABLE assets (
-  id              TEXT PRIMARY KEY,
-  filename     TEXT NOT NULL,
-  content_type TEXT NOT NULL,
-  size_bytes   INTEGER NOT NULL,
-  width        INTEGER,
-  height       INTEGER,
-  sha256       TEXT NOT NULL,
-  visibility   TEXT NOT NULL CHECK (visibility IN ('public', 'private')),
-  created_at   TIMESTAMP NOT NULL,
-  updated_at   TIMESTAMP NOT NULL,
-  deleted_at   TIMESTAMP
-);
-
-CREATE TABLE variants (
-  asset_id      TEXT NOT NULL REFERENCES assets(id),
-  hash          TEXT NOT NULL,
-  canonical_url TEXT NOT NULL,    -- for Cloudflare purge
-  stored_key    TEXT,             -- NULL when not stored in cached/
-  size_bytes    INTEGER,
-  last_accessed TIMESTAMP NOT NULL,
-  PRIMARY KEY (asset_id, hash)
-);
-
-CREATE TABLE api_keys (
-  id          TEXT PRIMARY KEY,
-  name        TEXT NOT NULL,
-  key_hash    TEXT NOT NULL,      -- never store the key itself
-  created_at  TIMESTAMP NOT NULL,
-  last_used   TIMESTAMP,
-  revoked_at  TIMESTAMP
-);
-```
-
-- `variants.last_accessed` is updated in batches, not on every request.
-- On Railway, SQLite lives on a volume. Litestream replication into the bucket is a later option.
+| Table | Purpose |
+|---|---|
+| `assets` | One row per upload: filename, content type, size, display dimensions, SHA-256, visibility, timestamps, `deleted_at` (soft delete). |
+| `variants` | Variants stored in `cached/`: key, content type, size, `last_accessed` (for the janitor). |
+| `served_urls` | Public URLs served with long cache lifetimes, for Cloudflare purging. |
+| `api_keys` | Name, SHA-256 of the key (the key itself is never stored), `last_used`, `revoked_at`. |
+| `schema_migrations` | Applied migration versions. |
 
 ### Write ordering and consistency
 
 - **Upload**: write the object first, then commit the row. A crash leaves an orphan object, never a row pointing at nothing.
-- **Visibility change**: update the row. Public → private also purges Cloudflare.
-- **Delete**: soft-delete the row (requests that reach picapi return 404 immediately), purge Cloudflare, then delete `originals/{id}` and `cached/{id}/` in the background.
-- **`picapi reconcile`**: reports, and with `--fix` repairs, orphan objects, rows without objects, and stale variants.
+- **Visibility change**: update the row. Public → private also purges Cloudflare, in the background.
+- **Delete**: soft-delete the row (requests that reach picapi return 404 immediately), then in the background purge Cloudflare and delete `originals/{id}` and `cached/{id}/`.
+- **Variant store**: the object is written, then the row is inserted only if the asset still exists; otherwise the object is deleted again.
+- **Reconcile** (`picapi reconcile`, `POST /api/v1/admin/reconcile`): reports, and with `--fix` repairs, orphan originals, orphan variants and stale variant rows. Live assets whose original is missing are reported only.
 
 ## URL grammar
 
@@ -193,8 +185,8 @@ CREATE TABLE api_keys (
 /i/{id}[/{transforms}][/{slug}.{ext}]
 ```
 
-- `transforms` is a comma-separated list of `key_value` pairs. The same parameters are also accepted as query parameters (`?w=320&f=webp`); non-canonical forms are redirected to the canonical path (see [Canonical URLs and purging](#canonical-urls-and-purging)).
-- `slug` is optional and ignored by the server. It exists for readable URLs and download filenames.
+- `transforms` is a comma-separated list of `key_value` pairs. The same parameters are also accepted as query parameters (`?w=320&f=webp`); non-canonical forms are redirected to the canonical path.
+- `slug` is optional and ignored by the server. It exists for readable URLs and download filenames. It must contain a dot (`name.ext`), which is how it is told apart from transforms.
 
 Examples:
 
@@ -202,35 +194,37 @@ Examples:
 /i/a8Kd93LmQx2Z
 /i/a8Kd93LmQx2Z/w_320,f_webp,q_70
 /i/a8Kd93LmQx2Z/w_640,h_640,fit_cover,f_avif/team-photo.avif
-/i/a8Kd93LmQx2Z/w_480,bg_remove,f_webp?s=<signature>
+/i/a8Kd93LmQx2Z/w_480,f_webp,bg_remove?s=<signature>
 ```
 
-### Transform parameters (v2.0)
+### Transform parameters
 
 | Key | Values | Meaning |
 |---|---|---|
-| `w`, `h` | pixels | Target width/height. Missing side keeps the aspect ratio. Never upscales unless `up_1`. |
-| `fit` | `inside` (default), `cover`, `fill` | `cover` crops to fill the box. |
-| `g` | `center` (default), `attention`, `n`, `s`, `e`, `w` | Crop gravity for `fit_cover`. `attention` is libvips smart crop. |
-| `f` | `jpeg`, `png`, `webp`, `avif`, `auto` | Output format. `auto` negotiates with `Accept`; only for deployments without a CDN. |
-| `q` | 1–100 | Quality for lossy formats. |
-| `dpr` | 1, 2, 3 | Multiplies `w`/`h`. |
+| `p` | `thumb`, `small`, `medium`, `large`, `og` | Preset; explicit keys override it. |
+| `w`, `h` | 1–4096 | Target width/height. A missing side keeps the aspect ratio. Never upscales unless `up_1`. |
+| `fit` | `inside` (default), `cover`, `fill` | `cover` crops to fill the box; `cover` and `fill` need both `w` and `h`. |
+| `g` | `center` (default), `attention`, `n`, `s`, `e`, `w` | Crop gravity, only with `fit_cover`. `attention` is libvips smart crop. |
+| `f` | `jpeg`, `png`, `webp`, `avif` | Output format. Default: the original's format (GIF becomes PNG). |
+| `q` | 1–100 | Quality for lossy formats (default 80). Not allowed with PNG output. |
+| `dpr` | 1, 2, 3 | Multiplies `w`/`h`; the result must stay ≤ 4096. |
+| `up` | 0, 1 | Allow upscaling. |
 | `bg` | `remove` | Background removal. Output must support alpha (png/webp/avif), unless `bgc` is set. |
-| `bgc` | hex color | Background color to fill after `bg_remove` (allows jpeg). |
+| `bgc` | 6-digit lowercase hex | Background color to fill after `bg_remove` (allows jpeg). |
 
-Always applied: EXIF orientation is honored and metadata (EXIF/GPS/XMP) is stripped.
+Always applied: EXIF orientation is honored, output is sRGB, and metadata (EXIF/GPS/XMP) is stripped. JPEG output flattens transparency onto white. Originals (`/i/{id}` with no transforms) are served byte for byte as uploaded.
 
-Limits: max output 4096×4096, a max decoded input pixel count (decompression-bomb protection), and a bounded number of concurrent transforms.
+Limits: max output 4096×4096, `MAX_INPUT_PIXELS` decoded input pixels (decompression-bomb protection), and `MAX_UPLOAD_BYTES` per upload.
 
 ### Allowed without a signature
 
-To bound how many variants can exist per image, unsigned requests may only use values from the grid below. Anything else is rejected with 400, unless the URL is signed.
+To bound how many variants can exist per image, unsigned requests may only use values from the grid below. Anything else returns 403 unless the URL is signed.
 
 - `w`, `h`: 64, 128, 256, 320, 480, 640, 960, 1280, 1920
 - `q`: 50, 60, 70, 80, 90
-- `f`, `fit`, `g`, `dpr`: any listed value
-- Named presets, e.g. `p_thumb` (see [Presets](#presets))
-- **Not** `bg_remove`. It always requires a signature or a token, because the first request costs seconds of CPU.
+- `f`, `fit`, `g`, `dpr`, `up`: any listed value
+- Presets, even where their values are off the grid (e.g. `p_og` is 1200×630)
+- **Not** `bg_remove`. It always requires a signature, because the first request costs seconds of CPU.
 
 ### Presets
 
@@ -244,112 +238,122 @@ Presets are hard-coded in the Go source. They are not stored in the database and
 | `p_large` | `w_1280,f_webp,q_80` |
 | `p_og` | `w_1200,h_630,fit_cover,g_attention,f_jpeg,q_80` (Open Graph / social previews) |
 
-A preset can be combined with explicit parameters, which override it (e.g. `p_thumb,f_avif`). The canonical URL keeps the preset name rather than its expansion, so the URL stays short.
+The canonical URL keeps the preset name rather than its expansion, so the URL stays short.
 
 ### Signed URLs
 
-`s` is an HMAC-SHA256 over the normalized path and parameters, using `SIGNING_SECRET`, encoded as base64url. Optional `exp` is a unix timestamp. The UI, CLI and MCP generate signed URLs through the API (`POST /api/v1/assets/{id}/url`).
+`s` is the base64url HMAC-SHA256 (with `SIGNING_SECRET`) of the path without slug, `/i/{id}/{canonical transforms}`, followed by `?exp={exp}` when the URL expires. The UI, CLI and MCP get signed URLs from `POST /api/v1/assets/{id}/url`, which signs automatically when the transforms need it.
 
 ## Authentication
 
 | Who | Mechanism |
 |---|---|
-| Management API, CLI, MCP | `Authorization: Bearer <api key>`. Keys are created via `picapi keys create`. The first key comes from `PICAPI_BOOTSTRAP_KEY`. |
-| Web UI | Log in with an API key → HttpOnly, Secure, SameSite=Strict session cookie. |
-| Viewing private assets | Short-lived JWT (HS256, `SIGNING_SECRET`) in `?token=`, because `<img>` cannot send headers. Claims: `sub` (asset id), `exp`, optional `var` (allowed transforms). |
+| Management API, CLI, MCP | `Authorization: Bearer <api key>`. The first key comes from `PICAPI_BOOTSTRAP_KEY` (created only when no keys exist); more keys via `picapi keys create`. Keys look like `pk_` + 40 base62 characters. |
+| Web UI | `POST /api/v1/session` with an API key → HttpOnly, SameSite=Strict session cookie (Secure on HTTPS), valid 30 days or until the key is revoked. Cookie-authenticated writes must send `X-Picapi-CSRF: 1`. |
+| Viewing private assets | Short-lived JWT (HS256, `SIGNING_SECRET`, claims `sub` = asset ID, `exp`) in `?token=`, because `<img>` cannot send headers. The web UI's session cookie also works. |
 | Public assets | No auth. Transforms limited to the grid, or signed. |
 
-Private responses are sent with `Cache-Control: private` and `Referrer-Policy: no-referrer`, so tokens in URLs don't leak to third parties through the `Referer` header.
+Private responses carry `Referrer-Policy: no-referrer`, and tokens are redacted from request logs.
 
-## HTTP API (sketch)
+## HTTP API
 
-All under `/api/v1`, JSON, API key required.
+All under `/api/v1`, JSON, authenticated (see above).
 
 ```
-POST   /assets                       upload (multipart); returns asset + URLs
-GET    /assets                       list (cursor pagination)
+POST   /session                      log in with {"key": ...} → cookie (no auth needed)
+DELETE /session                      log out
+GET    /session                      who am I
+
+POST   /assets                       upload (multipart: file, optional visibility, filename) → 201 asset
+GET    /assets?limit=&cursor=        list, newest first → {items, next_cursor}
 GET    /assets/{id}                  metadata
-PATCH  /assets/{id}                  filename, visibility
-DELETE /assets/{id}
-POST   /assets/{id}/url              build a (signed) delivery URL for given transforms
-POST   /assets/{id}/share            mint a viewer JWT for a private asset
-GET    /healthcheck                  (outside /api/v1, no auth)
+PATCH  /assets/{id}                  {filename?, visibility?}
+DELETE /assets/{id}                  → 204
+POST   /assets/{id}/url              {transforms?, slug?, expires_in?} → {url}, signed when needed
+POST   /assets/{id}/share            {transforms?, slug?, expires_in?} → {url, token, expires_at}
+
+GET    /keys                         list keys (never the key values)
+POST   /keys                         {name} → key, shown once
+DELETE /keys/{id}                    revoke (the last active key can't be revoked)
+
+POST   /admin/reconcile?fix=true     consistency report / repair
 ```
 
-Delivery routes (`/i/...`) are outside `/api/v1` so they can be cached separately.
+Outside `/api/v1`: `GET /healthcheck`, delivery at `/i/...`, MCP at `/mcp`, web UI at `/`.
 
-Uploads go through the API at first, so the server can validate the content type (by sniffing the bytes, not trusting the extension), read dimensions and compute the hash. Presigned direct-to-bucket uploads can be added later for large documents.
+Errors are always `{"error": "..."}` with `Cache-Control: no-store`.
 
 ## Clients
 
-- **CLI** (`picapi`): `upload`, `ls`, `rm`, `url --w 320 --f webp`, `share`, `keys`, `reconcile`, `serve`. It is the same binary as the server, so `serve` starts the server.
-- **MCP**: served by the API at `/mcp` (streamable HTTP) and authenticated with an API key. Its tools mirror the API: upload from a URL or base64, list, get URL, remove background, share.
-- **Web UI**: browse, upload (drag and drop), delete, toggle visibility, a URL builder with live preview, and copy URL.
+- **CLI** (`picapi`): `login`, `upload`, `ls`, `info`, `set`, `rm`, `url`, `share`, `keys`, `reconcile`. Credentials come from `PICAPI_URL`/`PICAPI_KEY` or from the config file written by `picapi login`.
+- **MCP** (`/mcp`, Bearer API key): tools `list_assets`, `get_asset`, `upload_from_url`, `upload_data`, `update_asset`, `delete_asset`, `get_url`, `share_asset`, `remove_background`. `upload_from_url` refuses private, loopback and link-local addresses, so it can't reach internal services.
+- **Web UI** (`/`): log in with an API key, browse, upload (button or drag and drop), rename, toggle visibility, delete, a URL builder with live preview and copy, and 24-hour share links.
 
 ## Security notes
 
-- SVG is never transformed or rendered inline. It is served with `Content-Disposition: attachment` and a restrictive CSP to prevent XSS on the image domain.
-- Uploads are limited by `MAX_UPLOAD_BYTES`. Content types are allow-listed.
-- libvips runs with a decoded-pixel limit and timeouts. Background removal runs behind a semaphore (`BG_CONCURRENCY`, default 1) and `singleflight`, so identical concurrent requests compute once.
-- API keys are stored hashed and shown only once.
+- SVG and other non-raster types are rejected at upload. The type is sniffed from the bytes, not trusted from the filename.
+- The web UI is served with a strict CSP (`default-src 'self'`), `X-Frame-Options: DENY` and `nosniff`.
+- API keys are stored as SHA-256 hashes and shown only once.
+- libvips runs with a decoded-pixel limit; renders and model runs are bounded by semaphores.
 
 ## Configuration
 
 | Variable | Default | Notes |
 |---|---|---|
+| `DATABASE_URL` | — | Required. Postgres connection string. |
 | `S3_ENDPOINT`, `S3_REGION`, `S3_BUCKET`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` | — | Required. |
-| `S3_USE_PATH_STYLE` | `true` | |
+| `S3_USE_PATH_STYLE` | `true` | Railway Buckets use virtual-hosted style: set `false`. |
 | `S3_ENV_PREFIX` | empty | Key prefix for sharing a bucket between environments. |
-| `DATABASE_PATH` | `/data/picapi.db` | SQLite file (on a volume). |
-| `DATABASE_URL` | empty | If set, use Postgres instead. |
-| `PUBLIC_BASE_URL` | — | e.g. `https://img.example.com`; used when building URLs. |
-| `SIGNING_SECRET` | — | Required. HMAC for signed URLs and JWTs. |
+| `PUBLIC_BASE_URL` | — | Required, e.g. `https://img.example.com`; used when building URLs. |
+| `SIGNING_SECRET` | — | Required, ≥ 32 characters. HMAC for signed URLs, JWTs and sessions. |
 | `PICAPI_BOOTSTRAP_KEY` | empty | Creates the first API key on startup if none exist. |
-| `VARIANT_STORE` | `on` | Store variants in `cached/`. |
+| `PORT` | `8080` | |
+| `VARIANT_STORE` | `true` | Store variants in `cached/`. |
 | `VARIANT_TTL` | `720h` | Janitor deletes variants not read for this long. |
-| `TRANSFORM_VERSION` | built-in | Override to force-invalidate all variants. |
+| `JANITOR_INTERVAL` | `1h` | |
+| `TRANSFORM_VERSION` | `1` | Bump to invalidate all stored variants and masks. |
 | `MAX_UPLOAD_BYTES` | `52428800` | 50 MB. |
+| `MAX_INPUT_PIXELS` | `100000000` | |
 | `TRANSFORM_CONCURRENCY` | number of CPUs | |
-| `BG_MODEL` | `isnet` | `u2netp`, `isnet`, `birefnet`, `off`. |
+| `BG_MODEL` | `isnet` | `isnet`, `u2netp`, `off`. |
 | `BG_CONCURRENCY` | `1` | |
-| `CLOUDFLARE_ZONE_ID`, `CLOUDFLARE_API_TOKEN` | empty | Enables purging on delete and public → private. |
+| `BG_MODEL_DIR`, `ONNXRUNTIME_LIB` | image paths | Only needed outside the Docker image. |
+| `CLOUDFLARE_ZONE_ID`, `CLOUDFLARE_API_TOKEN` | empty | Enables purging. Set both or neither. |
 
 ## Deployment
 
-Reference deployment: **Railway service (Docker image) + Railway volume (SQLite) + Railway Bucket**, with the custom domain on Cloudflare proxied to the Railway service. A Railway template is planned.
+### Railway (reference deployment)
 
-Any other host works as long as it can run the container and reach an S3-compatible bucket. Hosting the bucket in the same provider and region as the service keeps transforms on cache misses fast.
+Project `picapi-v2`, everything in EU West (Amsterdam):
 
-## Implementation status
+| Service | What |
+|---|---|
+| `picapi` | Built from `api-go/Dockerfile` with the repository root as build context (`RAILWAY_DOCKERFILE_PATH=api-go/Dockerfile`). No volume. |
+| `Postgres` | Railway Postgres. `DATABASE_URL=${{Postgres.DATABASE_URL}}` (private network). |
+| `picapi-images` | Railway Bucket. `S3_*` variables reference `${{picapi-images.ENDPOINT}}`, `REGION`, `BUCKET`, `ACCESS_KEY_ID`, `SECRET_ACCESS_KEY`. |
 
-Milestone 1 lives in `api-go/` (the earlier prototype in `api/` is superseded). Done:
+`img.janharkonen.fi` is a proxied Cloudflare CNAME to the Railway service, with a TXT record for Railway's domain verification. `SIGNING_SECRET` and `PICAPI_BOOTSTRAP_KEY` are generated once and stored only as Railway variables.
 
-- Config, S3 storage, SQLite with migrations, bootstrap API key.
-- Management API: upload, list, get, patch, delete, `url`, `share`.
-- Delivery: originals and variants, presets, grid and signed URLs, canonical redirects, private assets with JWTs, ETag/304, variant cache in `cached/`, `singleflight` + concurrency limit.
-- Debug headers on delivery: `X-Picapi-Variant` (hash), `X-Picapi-Cache` (`hit`/`miss`), `Server-Timing` (render time).
+Deploy with `railway up --service picapi` from the repository root, or connect the GitHub repository with the same Dockerfile path.
 
-Not yet: background removal (returns 501), Cloudflare purge and the URL table it needs, variant janitor, `reconcile`, CLI, MCP, web UI.
+### Elsewhere
 
-The variant table currently stores only stored variants; the canonical URL list for purging will be added together with purge.
+Any host that can run the container, reach Postgres and reach an S3-compatible bucket works. Hosting the bucket in the same provider and region as the server keeps cache misses fast.
 
-### Local development and tests
+## Local development and tests
 
 ```
-docker compose up -d --build        # SeaweedFS (S3) on :8333, API on :8081
+docker compose up -d --build        # SeaweedFS (S3) on :8333, Postgres on :5433, server on :8081
 cd conformance && npm install && npm run test:local
 ```
 
-`conformance/` is a black-box test suite run against a running instance (`BASE_URL`, `API_KEY`). It is test tooling only; it uses Node and sharp to generate and inspect images.
+`conformance/` is a black-box test suite run against a running instance (`BASE_URL`, `API_KEY`). It is test tooling only; it uses Node and sharp to generate and inspect images. The CLI can be built natively with `cd api-go && CGO_ENABLED=0 go build ./cmd/picapi`.
 
 ## Later
 
 - **Video posters**: an `ffmpeg` subprocess extracts a frame. The poster becomes an image, so all image transforms apply.
 - **PDF thumbnails**: `klippa-app/go-pdfium` in WebAssembly mode (no cgo) renders the first page.
 - Presigned direct uploads for large files.
-- Litestream replication of SQLite into the bucket.
-- `-slim` Docker image without ONNX Runtime and models.
-
-## Open questions
-
-None at the moment.
+- BiRefNet as a higher-quality background-removal model.
+- A `-slim` Docker image without ONNX Runtime and models.
+- Prebuilt CLI binaries on GitHub releases.

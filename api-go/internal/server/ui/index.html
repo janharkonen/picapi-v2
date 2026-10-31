@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>picapi</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <section id="login" hidden>
+    <form id="login-form" class="card narrow">
+      <h1>picapi</h1>
+      <label>API key <input id="login-key" type="password" autocomplete="current-password" required></label>
+      <button type="submit">Log in</button>
+      <p id="login-error" class="error" hidden></p>
+    </form>
+  </section>
+
+  <section id="app" hidden>
+    <header>
+      <h1>picapi</h1>
+      <label class="button">Upload<input id="file-input" type="file" accept="image/jpeg,image/png,image/gif,image/webp,image/avif" multiple hidden></label>
+      <button id="logout" class="secondary">Log out</button>
+    </header>
+    <p id="status" class="status" hidden></p>
+    <div id="drop-hint" class="drop-hint">Drop images anywhere to upload</div>
+    <main id="grid" class="grid"></main>
+    <button id="more" class="secondary" hidden>Load more</button>
+  </section>
+
+  <dialog id="detail">
+    <form method="dialog" class="detail">
+      <div class="preview"><img id="d-preview" alt=""></div>
+      <div class="fields">
+        <label>Filename <input id="d-filename"></label>
+        <label>Visibility
+          <select id="d-visibility"><option value="public">public</option><option value="private">private</option></select>
+        </label>
+        <p id="d-meta" class="meta"></p>
+
+        <fieldset>
+          <legend>URL builder</legend>
+          <div class="row">
+            <label>Preset
+              <select id="b-preset">
+                <option value="">none</option><option>thumb</option><option>small</option><option>medium</option><option>large</option><option>og</option>
+              </select>
+            </label>
+            <label>Width <input id="b-w" type="number" min="1" max="4096"></label>
+            <label>Height <input id="b-h" type="number" min="1" max="4096"></label>
+          </div>
+          <div class="row">
+            <label>Fit
+              <select id="b-fit"><option value="">inside</option><option>cover</option><option>fill</option></select>
+            </label>
+            <label>Gravity
+              <select id="b-g"><option value="">center</option><option>attention</option><option>n</option><option>s</option><option>e</option><option>w</option></select>
+            </label>
+            <label>Format
+              <select id="b-f"><option value="">original</option><option>webp</option><option>avif</option><option>jpeg</option><option>png</option></select>
+            </label>
+            <label>Quality <input id="b-q" type="number" min="1" max="100"></label>
+          </div>
+          <div class="row">
+            <label class="check"><input id="b-bg" type="checkbox"> Remove background</label>
+            <label>Slug <input id="b-slug" placeholder="photo.webp"></label>
+          </div>
+          <div class="url-row">
+            <input id="b-url" readonly>
+            <button type="button" id="b-copy">Copy</button>
+          </div>
+          <p id="b-error" class="error" hidden></p>
+        </fieldset>
+
+        <div class="actions">
+          <button type="button" id="d-save">Save</button>
+          <button type="button" id="d-share" class="secondary">Share link (24 h)</button>
+          <button type="button" id="d-delete" class="danger">Delete</button>
+          <button value="close" class="secondary">Close</button>
+        </div>
+      </div>
+    </form>
+  </dialog>
+</body>
+</html>

@@ -406,11 +406,185 @@ describe("signed URLs", () => {
     await expectError(await postJson(`/assets/${photo.id}/url`, { expires_in: 0 }), 400);
   });
 
-  test("background removal requires a signature and is not implemented yet", async () => {
+  test("background removal requires a signature", async () => {
     await expectError(await get(`/i/${photo.id}/f_png,bg_remove`), 403);
-    const res = await postJson(`/assets/${photo.id}/url`, { transforms: "bg_remove,f_png" });
-    const { url } = (await res.json()) as { url: string };
-    await expectError(await get(url), 501);
+  });
+});
+
+describe("background removal", () => {
+  let circle: Asset;
+  before(async () => {
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="600" height="400">
+      <rect width="600" height="400" fill="#ebebe1"/><circle cx="300" cy="200" r="120" fill="#c82828"/></svg>`;
+    circle = await uploadOk(await sharp(Buffer.from(svg)).png().toBuffer(), "circle.png");
+  });
+
+  const signedUrl = async (transforms: string) => {
+    const res = await postJson(`/assets/${circle.id}/url`, { transforms });
+    assert.equal(res.status, 200, await res.clone().text());
+    return ((await res.json()) as { url: string }).url;
+  };
+
+  test("cuts out the subject with transparency", async () => {
+    const res = await get(await signedUrl("f_png,bg_remove"));
+    assert.equal(res.status, 200, await res.clone().text());
+    const { data, info } = await sharp(Buffer.from(await res.arrayBuffer())).raw().toBuffer({ resolveWithObject: true });
+    assert.equal(info.channels, 4);
+    const alpha = (x: number, y: number) => data[(y * info.width + x) * 4 + 3]!;
+    assert.ok(alpha(5, 5) < 30, `corner alpha ${alpha(5, 5)}`);
+    assert.ok(alpha(300, 200) > 220, `center alpha ${alpha(300, 200)}`);
+  });
+
+  test("combines with resizing, other formats and a background color", async () => {
+    let out = await imageOf(await get(await signedUrl("w_256,f_webp,bg_remove")));
+    assert.deepEqual([out.format, out.width, out.height], ["webp", 256, 171]);
+    const res = await get(await signedUrl("w_128,f_jpeg,bg_remove,bgc_0000ff"));
+    out = await imageOf(res);
+    assert.deepEqual([out.format, out.width], ["jpeg", 128]);
+    const { data } = await sharp(out.buf).raw().toBuffer({ resolveWithObject: true });
+    assert.ok(data[2]! > 200 && data[0]! < 60, `corner should be blue, got ${data[0]},${data[1]},${data[2]}`);
+  });
+});
+
+describe("API keys", () => {
+  test("create, use and revoke", async () => {
+    const list = (await (await api("/keys")).json()) as { items: { id: string; name: string; revoked_at: string | null }[] };
+    assert.ok(list.items.length >= 1);
+
+    const res = await postJson("/keys", { name: "conformance" });
+    assert.equal(res.status, 201);
+    const created = (await res.json()) as { id: string; name: string; key: string };
+    assert.match(created.key, /^pk_[0-9A-Za-z]{40}$/);
+    assert.equal(created.name, "conformance");
+
+    const withNewKey = await fetch(`${baseUrl}/api/v1/assets?limit=1`, { headers: { Authorization: `Bearer ${created.key}` } });
+    assert.equal(withNewKey.status, 200);
+
+    const keys = (await (await api("/keys")).json()) as { items: { id: string; key?: string }[] };
+    assert.ok(keys.items.every((k) => k.key === undefined), "keys are never listed");
+
+    assert.equal((await api(`/keys/${created.id}`, { method: "DELETE" })).status, 204);
+    await expectError(await fetch(`${baseUrl}/api/v1/assets`, { headers: { Authorization: `Bearer ${created.key}` } }), 401);
+    await expectError(await api(`/keys/${created.id}`, { method: "DELETE" }), 404);
+    await expectError(await postJson("/keys", { name: "" }), 400);
+  });
+});
+
+describe("web UI session", () => {
+  test("login with a key gives a cookie session", async () => {
+    await expectError(await fetch(`${baseUrl}/api/v1/session`, { method: "POST", body: JSON.stringify({ key: "nope" }) }), 401);
+    const login = await fetch(`${baseUrl}/api/v1/session`, { method: "POST", body: JSON.stringify({ key: apiKey }) });
+    assert.equal(login.status, 200);
+    const setCookie = login.headers.get("set-cookie")!;
+    assert.match(setCookie, /picapi_session=[^;]+/);
+    assert.match(setCookie, /HttpOnly/i);
+    assert.match(setCookie, /SameSite=Strict/i);
+    const cookie = setCookie.split(";")[0]!;
+
+    const info = await fetch(`${baseUrl}/api/v1/session`, { headers: { Cookie: cookie } });
+    assert.equal(info.status, 200);
+    assert.equal(((await info.json()) as { auth: string }).auth, "session");
+
+    // Writes with a cookie need the CSRF header.
+    const asset = await uploadOk(await solid(20, 20), "session.jpg", { visibility: "private" });
+    const patch = (headers: Record<string, string>) =>
+      fetch(`${baseUrl}/api/v1/assets/${asset.id}`, {
+        method: "PATCH",
+        headers: { Cookie: cookie, "Content-Type": "application/json", ...headers },
+        body: JSON.stringify({ filename: "renamed.jpg" }),
+      });
+    await expectError(await patch({}), 403);
+    assert.equal((await patch({ "X-Picapi-CSRF": "1" })).status, 200);
+
+    // The UI can show private assets with its cookie.
+    const priv = await get(`/i/${asset.id}/w_64`, { headers: { Cookie: cookie } });
+    assert.equal(priv.status, 200);
+    assert.equal(priv.headers.get("cache-control"), "private, max-age=300");
+    await expectError(await get(`/i/${asset.id}/w_64`, { headers: { Cookie: "picapi_session=forged.1.x" } }), 403);
+
+    const logout = await fetch(`${baseUrl}/api/v1/session`, { method: "DELETE", headers: { Cookie: cookie } });
+    assert.equal(logout.status, 204);
+    assert.match(logout.headers.get("set-cookie")!, /Max-Age=0/i);
+  });
+
+  test("UI is served with a strict CSP", async () => {
+    const res = await get("/");
+    assert.equal(res.status, 200);
+    assert.match(res.headers.get("content-type")!, /text\/html/);
+    assert.match(res.headers.get("content-security-policy")!, /default-src 'self'/);
+    assert.match(await res.text(), /<title>picapi<\/title>/);
+    assert.equal((await get("/app.js")).status, 200);
+  });
+});
+
+describe("reconcile", () => {
+  test("reports bucket and database consistency", async () => {
+    const res = await api("/admin/reconcile", { method: "POST" });
+    assert.equal(res.status, 200);
+    const report = (await res.json()) as Record<string, unknown>;
+    assert.equal(report.fixed, false);
+    for (const key of ["orphan_originals", "missing_originals", "orphan_variants", "stale_variant_rows"]) {
+      assert.ok(Array.isArray(report[key]), key);
+    }
+    assert.deepEqual(report.missing_originals, []);
+  });
+});
+
+describe("MCP", () => {
+  const rpc = async (method: string, params: unknown = {}, key = apiKey) => {
+    const res = await fetch(`${baseUrl}/mcp`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${key}`,
+        "Content-Type": "application/json",
+        Accept: "application/json, text/event-stream",
+        "Mcp-Protocol-Version": "2025-06-18",
+      },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+    });
+    return res;
+  };
+
+  test("requires an API key", async () => {
+    await expectError(await rpc("tools/list", {}, "nope"), 401);
+  });
+
+  test("lists and calls tools", async () => {
+    const init = await rpc("initialize", {
+      protocolVersion: "2025-06-18",
+      capabilities: {},
+      clientInfo: { name: "conformance", version: "1" },
+    });
+    assert.equal(init.status, 200, await init.clone().text());
+
+    const list = (await (await rpc("tools/list")).json()) as { result: { tools: { name: string }[] } };
+    const names = list.result.tools.map((t) => t.name).sort();
+    for (const name of ["delete_asset", "get_asset", "get_url", "list_assets", "remove_background", "share_asset", "update_asset", "upload_data", "upload_from_url"]) {
+      assert.ok(names.includes(name), `missing tool ${name}`);
+    }
+
+    const call = async (name: string, args: unknown) => {
+      const res = await rpc("tools/call", { name, arguments: args });
+      assert.equal(res.status, 200);
+      return ((await res.json()) as { result: { isError?: boolean; structuredContent?: any; content: { text: string }[] } }).result;
+    };
+
+    const got = await call("get_asset", { id: photo.id });
+    assert.equal(got.structuredContent.id, photo.id);
+
+    const url = await call("get_url", { id: photo.id, transforms: "w_300" });
+    assert.match(url.structuredContent.url, /\/w_300\?s=/);
+
+    const data = (await solid(30, 20)).toString("base64");
+    const uploaded = await call("upload_data", { data, filename: "mcp.jpg" });
+    assert.equal(uploaded.structuredContent.width, 30);
+
+    const blocked = await call("upload_from_url", { url: "http://127.0.0.1:8080/healthcheck" });
+    assert.equal(blocked.isError, true);
+    assert.match(blocked.content[0]!.text, /non-public address/);
+
+    const missing = await call("get_asset", { id: "AAAAAAAAAAAA" });
+    assert.equal(missing.isError, true);
   });
 });
 

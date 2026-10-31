@@ -1,4 +1,4 @@
-package main
+package server
 
 import (
 	"fmt"
@@ -6,6 +6,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // S3Config holds settings for an S3-compatible object store.
@@ -24,20 +25,28 @@ type Config struct {
 	PublicBaseURL        string
 	SigningSecret        string
 	BootstrapKey         string
-	DatabasePath         string
+	DatabaseURL          string
 	S3                   S3Config
 	VariantStore         bool
+	VariantTTL           time.Duration
+	JanitorInterval      time.Duration
 	TransformVersion     string
 	MaxUploadBytes       int64
 	MaxInputPixels       int
 	TransformConcurrency int
+	CloudflareZoneID     string
+	CloudflareAPIToken   string
+	BGModel              string
+	BGModelDir           string
+	BGConcurrency        int
+	OnnxRuntimeLib       string
 }
 
-func loadConfig() (Config, error) {
+func LoadConfig() (Config, error) {
 	var missing []string
 	for _, name := range []string{
 		"S3_ENDPOINT", "S3_REGION", "S3_BUCKET", "S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY",
-		"PUBLIC_BASE_URL", "SIGNING_SECRET",
+		"PUBLIC_BASE_URL", "SIGNING_SECRET", "DATABASE_URL",
 	} {
 		if os.Getenv(name) == "" {
 			missing = append(missing, name)
@@ -51,7 +60,7 @@ func loadConfig() (Config, error) {
 		PublicBaseURL: strings.TrimRight(os.Getenv("PUBLIC_BASE_URL"), "/"),
 		SigningSecret: os.Getenv("SIGNING_SECRET"),
 		BootstrapKey:  os.Getenv("PICAPI_BOOTSTRAP_KEY"),
-		DatabasePath:  envOr("DATABASE_PATH", "./data/picapi.db"),
+		DatabaseURL:   os.Getenv("DATABASE_URL"),
 		S3: S3Config{
 			Endpoint:        os.Getenv("S3_ENDPOINT"),
 			Region:          os.Getenv("S3_REGION"),
@@ -60,7 +69,18 @@ func loadConfig() (Config, error) {
 			AccessKeyID:     os.Getenv("S3_ACCESS_KEY_ID"),
 			SecretAccessKey: os.Getenv("S3_SECRET_ACCESS_KEY"),
 		},
-		TransformVersion: envOr("TRANSFORM_VERSION", "1"),
+		TransformVersion:   envOr("TRANSFORM_VERSION", "1"),
+		CloudflareZoneID:   os.Getenv("CLOUDFLARE_ZONE_ID"),
+		CloudflareAPIToken: os.Getenv("CLOUDFLARE_API_TOKEN"),
+		BGModel:            envOr("BG_MODEL", "isnet"),
+		BGModelDir:         envOr("BG_MODEL_DIR", "/opt/picapi/models"),
+		OnnxRuntimeLib:     envOr("ONNXRUNTIME_LIB", "/usr/local/lib/libonnxruntime.so"),
+	}
+	if (cfg.CloudflareZoneID == "") != (cfg.CloudflareAPIToken == "") {
+		return Config{}, fmt.Errorf("CLOUDFLARE_ZONE_ID and CLOUDFLARE_API_TOKEN must be set together")
+	}
+	if _, ok := bgModels[cfg.BGModel]; !ok && cfg.BGModel != "off" {
+		return Config{}, fmt.Errorf("BG_MODEL must be isnet, u2netp or off")
 	}
 	if len(cfg.SigningSecret) < 32 {
 		return Config{}, fmt.Errorf("SIGNING_SECRET must be at least 32 characters")
@@ -90,6 +110,15 @@ func loadConfig() (Config, error) {
 	if cfg.TransformConcurrency, err = intEnv("TRANSFORM_CONCURRENCY", runtime.NumCPU()); err != nil {
 		return Config{}, err
 	}
+	if cfg.BGConcurrency, err = intEnv("BG_CONCURRENCY", 1); err != nil {
+		return Config{}, err
+	}
+	if cfg.VariantTTL, err = durationEnv("VARIANT_TTL", 30*24*time.Hour); err != nil {
+		return Config{}, err
+	}
+	if cfg.JanitorInterval, err = durationEnv("JANITOR_INTERVAL", time.Hour); err != nil {
+		return Config{}, err
+	}
 	return cfg, nil
 }
 
@@ -108,6 +137,18 @@ func intEnv(name string, fallback int) (int, error) {
 	parsed, err := strconv.Atoi(raw)
 	if err != nil || parsed <= 0 {
 		return 0, fmt.Errorf("%s must be a positive integer", name)
+	}
+	return parsed, nil
+}
+
+func durationEnv(name string, fallback time.Duration) (time.Duration, error) {
+	raw := os.Getenv(name)
+	if raw == "" {
+		return fallback, nil
+	}
+	parsed, err := time.ParseDuration(raw)
+	if err != nil || parsed <= 0 {
+		return 0, fmt.Errorf("%s must be a positive duration such as 720h", name)
 	}
 	return parsed, nil
 }

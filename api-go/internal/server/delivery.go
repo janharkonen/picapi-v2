@@ -1,8 +1,10 @@
-package main
+package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -23,7 +25,7 @@ type rendered struct {
 var expPattern = regexp.MustCompile(`^[0-9]{1,12}$`)
 
 // deliver serves originals and variants at /i/{id}[/{transforms}][/{slug}.{ext}].
-func (s *server) deliver(c *echo.Context) error {
+func (s *Server) deliver(c *echo.Context) error {
 	ctx := c.Request().Context()
 	id := c.Param("id")
 	var asset *Asset
@@ -119,11 +121,23 @@ func (s *server) deliver(c *echo.Context) error {
 	header := c.Response().Header()
 	cacheControl := fmt.Sprintf("public, max-age=%d, immutable", yearSeconds)
 	if asset.Visibility == "private" {
-		tokenExp, err := s.verifyViewToken(token, asset.ID)
-		if err != nil {
-			return err
+		if token != nil {
+			tokenExp, err := s.verifyViewToken(*token, asset.ID)
+			if err != nil {
+				return err
+			}
+			cacheControl = fmt.Sprintf("private, max-age=%d", max(0, tokenExp-time.Now().Unix()))
+		} else {
+			// The web UI shows private assets using its session cookie.
+			keyID, err := s.sessionKeyID(c)
+			if err != nil {
+				return err
+			}
+			if keyID == "" {
+				return httpError(http.StatusForbidden, "this asset is private")
+			}
+			cacheControl = "private, max-age=300"
 		}
-		cacheControl = fmt.Sprintf("private, max-age=%d", max(0, tokenExp-time.Now().Unix()))
 		header.Set("Referrer-Policy", "no-referrer")
 	}
 
@@ -142,12 +156,20 @@ func (s *server) deliver(c *echo.Context) error {
 	} else if t.needsSignature() {
 		return httpError(http.StatusForbidden, "these transforms require a signed URL")
 	}
-	if resolved != nil && resolved.BG {
-		return httpError(http.StatusNotImplemented, "background removal is not implemented yet")
+	if resolved != nil && resolved.BG && s.bg == nil {
+		return httpError(http.StatusNotImplemented, errBGDisabled.Error())
 	}
 
+	// Signed URLs that expire must not outlive their expiry in caches.
+	if exp != nil && asset.Visibility == "public" {
+		cacheControl = fmt.Sprintf("public, max-age=%d", max(0, expUnix-time.Now().Unix()))
+	}
 	header.Set("Cache-Control", cacheControl)
 	header.Set("X-Content-Type-Options", "nosniff")
+
+	if asset.Visibility == "public" {
+		s.recordServed(asset.ID, canonicalURL)
+	}
 
 	if resolved == nil {
 		etag := `"` + asset.SHA256 + `"`
@@ -207,29 +229,14 @@ func (s *server) deliver(c *echo.Context) error {
 	// Concurrent requests for one variant share a render. The render ignores the request's
 	// cancellation, because other requests may be waiting for it.
 	result, err, _ := s.inflight.Do(hash, func() (any, error) {
-		s.transforms <- struct{}{}
-		defer func() { <-s.transforms }()
-		started := time.Now()
-		original, err := s.storage.getBytes(context.Background(), s.storage.originalKey(asset.ID))
-		if err != nil {
-			return nil, err
-		}
-		data, err := render(original, *resolved, s.cfg.MaxInputPixels)
-		if err != nil {
-			return nil, err
-		}
-		return &rendered{
-			data:        data,
-			contentType: outputContentTypes[resolved.F],
-			durationMs:  float64(time.Since(started).Microseconds()) / 1000,
-		}, nil
+		return s.renderVariant(asset, *resolved)
 	})
 	if err != nil {
 		return err
 	}
 	out := result.(*rendered)
 	if s.cfg.VariantStore {
-		s.storeVariant(c, asset.ID, hash, resolved.F, out)
+		s.storeVariant(asset.ID, hash, resolved.F, out)
 	}
 
 	header.Set("X-Picapi-Cache", "miss")
@@ -238,41 +245,108 @@ func (s *server) deliver(c *echo.Context) error {
 	return c.Blob(http.StatusOK, out.contentType, out.data)
 }
 
+func (s *Server) renderVariant(asset *Asset, r Resolved) (*rendered, error) {
+	ctx := context.Background()
+	started := time.Now()
+	original, err := s.storage.getBytes(ctx, s.storage.originalKey(asset.ID))
+	if err != nil {
+		return nil, err
+	}
+	if r.BG {
+		mask, err := s.backgroundMask(ctx, asset.ID, original)
+		if err != nil {
+			return nil, err
+		}
+		if original, err = cutout(original, mask, r.BGC); err != nil {
+			return nil, err
+		}
+	}
+	s.transforms <- struct{}{}
+	data, err := render(original, r, s.cfg.MaxInputPixels)
+	<-s.transforms
+	if err != nil {
+		return nil, err
+	}
+	return &rendered{
+		data:        data,
+		contentType: outputContentTypes[r.F],
+		durationMs:  float64(time.Since(started).Microseconds()) / 1000,
+	}, nil
+}
+
+// backgroundMask returns the stored mask, computing and storing it on first use.
+func (s *Server) backgroundMask(ctx context.Context, assetID string, original []byte) ([]byte, error) {
+	key := s.storage.maskKey(assetID, s.cfg.BGModel, s.cfg.TransformVersion)
+	result, err, _ := s.inflight.Do("mask:"+key, func() (any, error) {
+		obj, err := s.storage.get(ctx, key)
+		if err != nil {
+			return nil, err
+		}
+		if obj != nil {
+			defer obj.Body.Close()
+			return io.ReadAll(obj.Body)
+		}
+		mask, err := s.bg.mask(original)
+		if err != nil {
+			if errors.Is(err, errBGDisabled) {
+				return nil, httpError(http.StatusNotImplemented, err.Error())
+			}
+			return nil, fmt.Errorf("background removal: %w", err)
+		}
+		if err := s.storage.put(ctx, key, mask, "image/png", nil); err != nil {
+			return nil, err
+		}
+		return mask, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result.([]byte), nil
+}
+
 // storeVariant saves a render in the background. Concurrent requests share a render, but only one stores it.
-func (s *server) storeVariant(c *echo.Context, assetID, hash, format string, out *rendered) {
+func (s *Server) storeVariant(assetID, hash, format string, out *rendered) {
 	if _, busy := s.storing.LoadOrStore(hash, true); busy {
 		return
 	}
-	logger := c.Echo().Logger
 	go func() {
 		defer s.storing.Delete(hash)
 		ctx := context.Background()
 		key := s.storage.variantKey(assetID, hash, format)
 		if err := s.storage.put(ctx, key, out.data, out.contentType, nil); err != nil {
-			logger.Error("storing variant failed", "key", key, "error", err)
+			s.logger.Error("storing variant failed", "key", key, "error", err)
 			return
 		}
-		// Skip if the asset was deleted meanwhile; its cleanup won't see this row.
-		asset, err := s.db.getAsset(ctx, assetID)
-		if err == nil && asset != nil {
-			err = s.db.upsertVariant(ctx, assetID, hash, Variant{
-				StoredKey:   key,
-				ContentType: out.contentType,
-				SizeBytes:   int64(len(out.data)),
-			})
+		recorded, err := s.db.upsertVariant(ctx, assetID, hash, Variant{
+			StoredKey:   key,
+			ContentType: out.contentType,
+			SizeBytes:   int64(len(out.data)),
+		})
+		if err == nil && !recorded {
+			// The asset was deleted meanwhile; its cleanup won't see this object.
+			err = s.storage.delete(ctx, key)
 		}
 		if err != nil {
-			logger.Error("recording variant failed", "key", key, "error", err)
+			s.logger.Error("recording variant failed", "key", key, "error", err)
 		}
 	}()
 }
 
-func (s *server) verifyViewToken(token *string, assetID string) (int64, error) {
-	if token == nil {
-		return 0, httpError(http.StatusForbidden, "this asset is private")
+// recordServed remembers a public URL so it can be purged from the CDN later.
+func (s *Server) recordServed(assetID, path string) {
+	if !s.servedSeen.add(assetID, path) {
+		return
 	}
+	go func() {
+		if err := s.db.recordServedURL(context.Background(), assetID, path); err != nil {
+			s.logger.Error("recording served URL failed", "path", path, "error", err)
+		}
+	}()
+}
+
+func (s *Server) verifyViewToken(token, assetID string) (int64, error) {
 	invalid := httpError(http.StatusForbidden, "invalid or expired token")
-	parsed, err := jwt.Parse(*token, func(*jwt.Token) (any, error) {
+	parsed, err := jwt.Parse(token, func(*jwt.Token) (any, error) {
 		return []byte(s.cfg.SigningSecret), nil
 	}, jwt.WithValidMethods([]string{"HS256"}), jwt.WithExpirationRequired())
 	if err != nil {
