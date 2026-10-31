@@ -20,14 +20,16 @@
 ## Overview
 
 ```
-                                     ┌──────────────── Railway ────────────────┐
-browser / <img> ──▶ Cloudflare CDN ──miss──▶ picapi-server (Go) ──▶ Railway Bucket
-                    (edge cache)     │        ├─ libvips (govips)              │
-CLI / MCP / UI ──────────────────────▶        └─ ONNX Runtime (bg removal)     │
-                                     └─────────────────────────────────────────┘
+                                     ┌──────────────────────── Railway ─────────────────────────┐
+browser / <img> ──▶ Cloudflare CDN ──miss──▶ picapi-server (Go) ──▶ Railway Bucket            │
+                    (edge cache)     │        ├─ libvips, ONNX Runtime                         │
+CLI / MCP / browser ─────────────────▶        └─ /ui/* ──private network──▶ picapi-web         │
+                                     │                 ◀── remote functions call the API ──┘   │
+                                     └──────────────────────────────────────────────────────────┘
 ```
 
-- **picapi-server** is a single, stateless Go service. It delivers pictures, runs the management API and the MCP endpoint, and serves the embedded web UI.
+- **picapi-server** is a single, stateless Go service. It delivers pictures, runs the management API, the event stream and the MCP endpoint, and reverse-proxies the frontend.
+- **picapi-web** is a SvelteKit app (Node, `adapter-node`) on Railway's private network, with no public domain. `/` redirects to `/ui`, and the Go server proxies `/ui/*` to it, so it shares the public origin and session cookie.
 - **The bucket** is any S3-compatible store and is the only storage. Each picture is one object, `public/{id}`, whose metadata is stored on the object itself.
 - **Cloudflare** sits in front of the public hostname as a reverse proxy/CDN (DNS record proxied, orange cloud). It is the cache users actually hit.
 - **picapi** (CLI) is a separate, pure-Go binary that talks to the HTTP API. It needs no cgo or libvips.
@@ -181,6 +183,12 @@ At most `BG_CONCURRENCY` (default 1) model runs happen at once.
 | Web UI | `POST /api/v1/session` with the key → HttpOnly, SameSite=Strict session cookie (Secure on HTTPS), valid 30 days. The cookie is bound to the current key, so changing the key ends all sessions. Cookie-authenticated writes must send `X-Picapi-CSRF: 1`. |
 | Viewing pictures | No auth. |
 
+## Live updates
+
+The Go server publishes an event whenever a picture is uploaded or deleted, by any client (UI, CLI, MCP, API). `GET /api/v1/events` streams them as Server-Sent Events (`event: asset`, `data: {"type":"created"|"deleted","id":...}`, heartbeat comments every 20 s). Events are in-process, which fits the single-instance deployment.
+
+The frontend's image grid is a SvelteKit [`query.live`](https://svelte.dev/docs/kit/remote-functions#query.live) remote function: an async generator on the SvelteKit server that yields the asset list, then subscribes to the event stream (with the visitor's cookie) and yields a fresh list after each event. SvelteKit streams those values to every open page, and reconnects with backoff if the connection drops.
+
 ## HTTP API
 
 All under `/api/v1`, JSON, authenticated.
@@ -195,15 +203,16 @@ GET    /assets?limit=&cursor=        list, newest first → {items, next_cursor}
 GET    /assets/{id}                  metadata
 DELETE /assets/{id}                  delete and purge from Cloudflare → 204
 POST   /assets/{id}/url              {transforms?, slug?, expires_in?} → {url}, signed when needed
+GET    /events                       Server-Sent Events: asset created / deleted
 ```
 
-Outside `/api/v1`: `GET /healthcheck`, delivery at `/i/...`, MCP at `/mcp`, web UI at `/`. Errors are always `{"error": "..."}` with `Cache-Control: no-store`.
+Outside `/api/v1`: `GET /healthcheck`, delivery at `/i/...`, MCP at `/mcp`, `/` → redirect to `/ui`, and `/ui/*` → the frontend. Errors are always `{"error": "..."}` with `Cache-Control: no-store`.
 
 ## Clients
 
 - **CLI** (`picapi`): `login`, `upload`, `ls`, `info`, `rm`, `url`. Credentials come from `PICAPI_URL`/`PICAPI_KEY` or from the config file written by `picapi login`.
 - **MCP** (`/mcp`, Bearer key): `list_assets`, `get_asset`, `upload_from_url`, `upload_data`, `delete_asset`, `get_url`, `remove_background`. `upload_from_url` refuses private, loopback and link-local addresses.
-- **Web UI** (`/`): log in with the key, browse, upload (button or drag and drop), delete, and a URL builder with live preview and copy.
+- **Web UI** (`/ui`, SvelteKit): log in with the key, browse, upload (button or drag and drop), delete, and a URL builder with live preview and copy. The grid is live: see [Live updates](#live-updates).
 
 ## Code layout
 
@@ -211,12 +220,12 @@ Outside `/api/v1`: `GET /healthcheck`, delivery at `/i/...`, MCP at `/mcp`, web 
 api-go/
   cmd/picapi-server/   server entry point
   cmd/picapi/          CLI (CGO_ENABLED=0)
-  internal/server/     delivery, transforms, background removal, API, MCP, UI, purge, storage
-  internal/server/ui/  web UI (HTML, CSS, JS)
+  internal/server/     delivery, transforms, background removal, API, events, MCP, frontend proxy, purge, storage
   internal/client/     HTTP client used by the CLI
   Dockerfile           build context is the repository root
+  .env.example         local configuration template
+web/                   SvelteKit frontend (remote functions, live queries); Dockerfile
 conformance/           black-box HTTP test suite
-docker-compose.yml     local SeaweedFS (S3) + server
 ```
 
 ## Configuration
@@ -226,6 +235,7 @@ docker-compose.yml     local SeaweedFS (S3) + server
 | `PICAPI_API_KEY` | — | Required, ≥ 32 characters. |
 | `SIGNING_SECRET` | — | Required, ≥ 32 characters. HMAC for signed URLs and sessions. |
 | `PUBLIC_BASE_URL` | — | Required, e.g. `https://img.example.com`. |
+| `FRONTEND_URL` | empty | Internal URL of the SvelteKit app, proxied under `/ui`. Without it `/ui` returns 503. |
 | `S3_ENDPOINT`, `S3_REGION`, `S3_BUCKET`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` | — | Required. |
 | `S3_USE_PATH_STYLE` | `true` | Railway Buckets use virtual-hosted style: set `false`. |
 | `S3_ENV_PREFIX` | empty | Key prefix for sharing a bucket between environments. |
@@ -248,20 +258,35 @@ Project `picapi-v2`, in EU West (Amsterdam):
 | Service | What |
 |---|---|
 | `picapi` | Built from `api-go/Dockerfile` with the repository root as build context (`RAILWAY_DOCKERFILE_PATH=api-go/Dockerfile`). Stateless, no volume. |
+| `picapi-web` | Built from `web/Dockerfile` (root build context). No public domain. Variables: `PICAPI_API_URL=http://${{picapi.RAILWAY_PRIVATE_DOMAIN}}:8080`, `ORIGIN=https://img.janharkonen.fi`, `PORT=3000`, `HOST=::`. The API has `FRONTEND_URL=http://${{picapi-web.RAILWAY_PRIVATE_DOMAIN}}:3000`. |
 | `picapi-images` | Railway Bucket. `S3_*` variables reference `${{picapi-images.ENDPOINT}}`, `REGION`, `BUCKET`, `ACCESS_KEY_ID`, `SECRET_ACCESS_KEY`. |
+| `picapi-images-dev` | Railway Bucket for local development only. |
 
 `img.janharkonen.fi` is a proxied Cloudflare CNAME to the Railway service, with a TXT record for Railway's domain verification. `PICAPI_API_KEY` and `SIGNING_SECRET` are stored only as Railway variables.
 
-Deploy with `railway up --service picapi` from the repository root, or connect the GitHub repository with the same Dockerfile path.
+Deploy with `railway up --service picapi` and `railway up --service picapi-web` from the repository root, or connect the GitHub repository with the same Dockerfile paths.
+
+Because `ORIGIN` is the public URL, logging in to the UI only works through `img.janharkonen.fi`, not the `*.up.railway.app` domain (SvelteKit's origin check for forms and commands).
 
 ## Local development and tests
 
+Local development runs natively against the Railway bucket `picapi-images-dev`; there is no local S3 or Docker setup.
+
 ```
-docker compose up -d --build        # SeaweedFS (S3) on :8333, server on :8081
-cd conformance && npm install && npm run test:local
+brew install vips                                   # libvips for the Go server (cgo)
+cp api-go/.env.example api-go/.env                  # fill in from: railway bucket credentials --bucket picapi-images-dev
+cp web/.env.example web/.env
+
+cd api-go && go run ./cmd/picapi-server             # http://localhost:8080
+cd web && npm install && npm run dev                # SvelteKit on :5173, proxied by the Go server
+open http://localhost:8080                          # → /ui
+
+cd conformance && npm install && npm run test:local # reads the API key from api-go/.env
 ```
 
-`conformance/` is a black-box test suite run against a running instance (`BASE_URL`, `API_KEY`). It uses Node and sharp to generate and inspect images. The CLI builds natively with `cd api-go && CGO_ENABLED=0 go build ./cmd/picapi`.
+Locally `BG_MODEL=off`, because ONNX Runtime 1.31 and the models are only in the Docker image; the background-removal tests skip when the server returns 501.
+
+`conformance/` is a black-box test suite run against a running instance (`BASE_URL`, `API_KEY`). It uses Node and sharp to generate and inspect images. The CLI builds with `cd api-go && CGO_ENABLED=0 go build ./cmd/picapi`.
 
 ## Later
 

@@ -24,6 +24,7 @@ type Server struct {
 	bg         *bgRemover
 	transforms chan struct{} // semaphore
 	inflight   singleflight.Group
+	events     eventHub
 }
 
 // Run starts the server and blocks until ctx is cancelled.
@@ -45,7 +46,7 @@ func Run(ctx context.Context, cfg Config, logger *slog.Logger) error {
 
 	logger.Info("picapi starting",
 		"s3_endpoint", cfg.S3.Endpoint, "bucket", cfg.S3.Bucket, "prefix", s.storage.prefix,
-		"cloudflare_purge", s.purger.enabled(), "bg_model", cfg.BGModel)
+		"cloudflare_purge", s.purger.enabled(), "bg_model", cfg.BGModel, "frontend", cfg.FrontendURL)
 	sc := echo.StartConfig{Address: ":" + strconv.Itoa(cfg.Port), HideBanner: true}
 	if err := sc.Start(ctx, s.routes()); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
@@ -86,6 +87,7 @@ func (s *Server) routes() *echo.Echo {
 	api.GET("/assets/:id", s.getAsset)
 	api.DELETE("/assets/:id", s.deleteAsset)
 	api.POST("/assets/:id/url", s.assetURL)
+	api.GET("/events", s.streamEvents)
 
 	mcpHandler := echo.WrapHandler(s.mcpHandler())
 	for _, method := range []string{http.MethodGet, http.MethodPost, http.MethodDelete} {
@@ -97,7 +99,7 @@ func (s *Server) routes() *echo.Echo {
 		e.HEAD(path, s.deliver)
 	}
 
-	s.registerUI(e)
+	s.registerFrontend(e)
 	return e
 }
 

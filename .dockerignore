@@ -2,5 +2,7 @@
 **/.env
 **/node_modules
 **/data
+**/.svelte-kit
+**/build
 api/
 conformance/

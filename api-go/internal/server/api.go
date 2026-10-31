@@ -97,6 +97,7 @@ func (s *Server) createAsset(ctx context.Context, buf []byte, filename string) (
 	if err := s.storage.put(ctx, asset, buf); err != nil {
 		return nil, err
 	}
+	s.events.publish(assetEvent{Type: "created", ID: asset.ID})
 	// Read back so created_at is the bucket's LastModified, as in every later response.
 	return s.lookupAsset(ctx, asset.ID)
 }
@@ -106,6 +107,7 @@ func (s *Server) removeAsset(ctx context.Context, asset *Asset) error {
 	if err := s.storage.delete(ctx, asset.ID); err != nil {
 		return err
 	}
+	s.events.publish(assetEvent{Type: "deleted", ID: asset.ID})
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 		defer cancel()

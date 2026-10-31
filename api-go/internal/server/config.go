@@ -24,6 +24,7 @@ type Config struct {
 	PublicBaseURL        string
 	SigningSecret        string
 	APIKey               string
+	FrontendURL          string
 	S3                   S3Config
 	TransformVersion     string
 	MaxUploadBytes       int64
@@ -55,6 +56,7 @@ func LoadConfig() (Config, error) {
 		PublicBaseURL: strings.TrimRight(os.Getenv("PUBLIC_BASE_URL"), "/"),
 		SigningSecret: os.Getenv("SIGNING_SECRET"),
 		APIKey:        os.Getenv("PICAPI_API_KEY"),
+		FrontendURL:   strings.TrimRight(os.Getenv("FRONTEND_URL"), "/"),
 		S3: S3Config{
 			Endpoint:        os.Getenv("S3_ENDPOINT"),
 			Region:          os.Getenv("S3_REGION"),

@@ -6,8 +6,9 @@ import { createHash } from "node:crypto";
 import { before, describe, test } from "node:test";
 import sharp from "sharp";
 
-const baseUrl = (process.env.BASE_URL ?? "http://localhost:8081").replace(/\/+$/, "");
-const apiKey = process.env.API_KEY ?? "dev-api-key-0123456789abcdefghijklmn";
+const baseUrl = (process.env.BASE_URL ?? "http://localhost:8080").replace(/\/+$/, "");
+const apiKey = process.env.API_KEY ?? "";
+if (!apiKey) throw new Error("set API_KEY (npm run test:local reads it from api-go/.env)");
 const transformVersion = process.env.TRANSFORM_VERSION ?? "1";
 
 type Asset = {
@@ -414,8 +415,9 @@ describe("background removal", () => {
     return ((await res.json()) as { url: string }).url;
   };
 
-  test("cuts out the subject with transparency", async () => {
+  test("cuts out the subject with transparency", async (t) => {
     const res = await get(await signedUrl("f_png,bg_remove"));
+    if (res.status === 501) return t.skip("background removal is disabled on this server");
     assert.equal(res.status, 200, await res.clone().text());
     const { data, info } = await sharp(Buffer.from(await res.arrayBuffer())).raw().toBuffer({ resolveWithObject: true });
     assert.equal(info.channels, 4);
@@ -424,8 +426,10 @@ describe("background removal", () => {
     assert.ok(alpha(300, 200) > 220, `center alpha ${alpha(300, 200)}`);
   });
 
-  test("combines with resizing, other formats and a background color", async () => {
-    let out = await imageOf(await get(await signedUrl("w_256,f_webp,bg_remove")));
+  test("combines with resizing, other formats and a background color", async (t) => {
+    const first = await get(await signedUrl("w_256,f_webp,bg_remove"));
+    if (first.status === 501) return t.skip("background removal is disabled on this server");
+    let out = await imageOf(first);
     assert.deepEqual([out.format, out.width, out.height], ["webp", 256, 171]);
     const res = await get(await signedUrl("w_128,f_jpeg,bg_remove,bgc_0000ff"));
     out = await imageOf(res);
@@ -463,13 +467,55 @@ describe("web UI session", () => {
     assert.match(logout.headers.get("set-cookie")!, /Max-Age=0/i);
   });
 
-  test("UI is served with a strict CSP", async () => {
+  test("/ redirects to the frontend, which is proxied under /ui", async () => {
     const res = await get("/");
+    assert.equal(res.status, 302);
+    assert.equal(res.headers.get("location"), "/ui");
+    const ui = await fetch(`${baseUrl}/ui`); // follows the frontend's own trailing-slash redirect, if any
+    assert.equal(ui.status, 200);
+    assert.match(ui.headers.get("content-type")!, /text\/html/);
+    assert.match(await ui.text(), /<title>picapi<\/title>/);
+  });
+});
+
+describe("live events", () => {
+  test("uploads and deletes are streamed as server-sent events", async () => {
+    await expectError(await fetch(`${baseUrl}/api/v1/events`), 401);
+
+    const controller = new AbortController();
+    const res = await fetch(`${baseUrl}/api/v1/events`, {
+      headers: { Authorization: `Bearer ${apiKey}` },
+      signal: controller.signal,
+    });
     assert.equal(res.status, 200);
-    assert.match(res.headers.get("content-type")!, /text\/html/);
-    assert.match(res.headers.get("content-security-policy")!, /default-src 'self'/);
-    assert.match(await res.text(), /<title>picapi<\/title>/);
-    assert.equal((await get("/app.js")).status, 200);
+    assert.match(res.headers.get("content-type")!, /text\/event-stream/);
+    assert.equal(res.headers.get("cache-control"), "no-store");
+
+    const reader = res.body!.pipeThrough(new TextDecoderStream()).getReader();
+    let buffer = "";
+    const nextEvent = async () => {
+      const deadline = Date.now() + 10_000;
+      while (Date.now() < deadline) {
+        const end = buffer.indexOf("\n\n");
+        if (end >= 0) {
+          const message = buffer.slice(0, end);
+          buffer = buffer.slice(end + 2);
+          const data = message.split("\n").find((line) => line.startsWith("data:"));
+          if (data) return JSON.parse(data.slice(5)) as { type: string; id: string };
+          continue;
+        }
+        const { value, done } = await reader.read();
+        if (done) throw new Error("stream ended");
+        buffer += value;
+      }
+      throw new Error("no event within 10 s");
+    };
+
+    const asset = await uploadOk(await solid(12, 12), "event.jpg");
+    assert.deepEqual(await nextEvent(), { type: "created", id: asset.id });
+    assert.equal((await api(`/assets/${asset.id}`, { method: "DELETE" })).status, 204);
+    assert.deepEqual(await nextEvent(), { type: "deleted", id: asset.id });
+    controller.abort();
   });
 });
 
