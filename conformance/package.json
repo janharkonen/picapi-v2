@@ -1,0 +1,13 @@
+{
+  "name": "picapi-conformance",
+  "private": true,
+  "type": "module",
+  "description": "Black-box tests that every picapi implementation must pass",
+  "scripts": {
+    "test": "node --test --test-concurrency=1 conformance.test.ts",
+    "test:local": "BASE_URL=http://localhost:8081 node --test --test-concurrency=1 conformance.test.ts"
+  },
+  "dependencies": {
+    "sharp": "^0.35.5"
+  }
+}
