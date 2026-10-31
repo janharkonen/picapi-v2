@@ -78,6 +78,7 @@ dialog::backdrop { background: rgb(0 0 0 / .5); }
 }
 .preview img { max-width: 100%; max-height: 60vh; }
 .fields { display: flex; flex-direction: column; gap: .75rem; }
+.fields h2 { font-size: 1.1rem; margin: 0; overflow-wrap: anywhere; }
 .meta { color: var(--muted); font-size: .85rem; margin: 0; }
 fieldset { border: 1px solid var(--border); border-radius: 8px; display: flex; flex-direction: column; gap: .6rem; }
 legend { color: var(--muted); font-size: .85rem; }

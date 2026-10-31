@@ -6,12 +6,21 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
 )
+
+// The bucket is the only store. Each asset is one object at {prefix}public/{id}; its
+// metadata lives in the object's Content-Type and x-amz-meta-* headers.
 
 type Storage struct {
 	client *s3.Client
@@ -19,10 +28,16 @@ type Storage struct {
 	prefix string
 }
 
-type storedObject struct {
-	Body        io.ReadCloser
+// Asset is the metadata of one stored picture.
+type Asset struct {
+	ID          string
+	Filename    string
 	ContentType string
-	Size        int64 // -1 when unknown
+	SizeBytes   int64
+	Width       int
+	Height      int
+	SHA256      string
+	CreatedAt   time.Time
 }
 
 func newStorage(cfg S3Config) *Storage {
@@ -37,120 +52,128 @@ func newStorage(cfg S3Config) *Storage {
 		RequestChecksumCalculation: aws.RequestChecksumCalculationWhenRequired,
 		ResponseChecksumValidation: aws.ResponseChecksumValidationWhenRequired,
 	})
-	return &Storage{client: client, bucket: cfg.Bucket, prefix: cfg.EnvPrefix}
+	return &Storage{client: client, bucket: cfg.Bucket, prefix: cfg.EnvPrefix + "public/"}
 }
 
-func (s *Storage) originalKey(id string) string {
-	return s.prefix + "originals/" + id
+func (s *Storage) key(id string) string {
+	return s.prefix + id
 }
 
-func (s *Storage) variantPrefix(id string) string {
-	return s.prefix + "cached/" + id + "/"
+func isNotFound(err error) bool {
+	var noSuchKey *types.NoSuchKey
+	var notFound *types.NotFound
+	var apiErr smithy.APIError
+	return errors.As(err, &noSuchKey) || errors.As(err, &notFound) ||
+		(errors.As(err, &apiErr) && (apiErr.ErrorCode() == "NotFound" || apiErr.ErrorCode() == "NoSuchKey"))
 }
 
-func (s *Storage) variantKey(id, hash, ext string) string {
-	return s.variantPrefix(id) + hash + "." + ext
+func assetMetadata(a *Asset) map[string]string {
+	return map[string]string{
+		"filename": url.PathEscape(a.Filename),
+		"width":    strconv.Itoa(a.Width),
+		"height":   strconv.Itoa(a.Height),
+		"sha256":   a.SHA256,
+	}
 }
 
-func (s *Storage) put(ctx context.Context, key string, body []byte, contentType string, metadata map[string]string) error {
+func assetFromObject(id, contentType string, size int64, modified time.Time, meta map[string]string) *Asset {
+	a := &Asset{ID: id, ContentType: contentType, SizeBytes: size, CreatedAt: modified, SHA256: meta["sha256"]}
+	a.Filename, _ = url.PathUnescape(meta["filename"])
+	if a.Filename == "" {
+		a.Filename = id
+	}
+	a.Width, _ = strconv.Atoi(meta["width"])
+	a.Height, _ = strconv.Atoi(meta["height"])
+	return a
+}
+
+func (s *Storage) put(ctx context.Context, a *Asset, body []byte) error {
 	_, err := s.client.PutObject(ctx, &s3.PutObjectInput{
 		Bucket:        aws.String(s.bucket),
-		Key:           aws.String(key),
+		Key:           aws.String(s.key(a.ID)),
 		Body:          bytes.NewReader(body),
 		ContentLength: aws.Int64(int64(len(body))),
-		ContentType:   aws.String(contentType),
-		Metadata:      metadata,
+		ContentType:   aws.String(a.ContentType),
+		Metadata:      assetMetadata(a),
 	})
 	if err != nil {
-		return fmt.Errorf("put object %q: %w", key, err)
+		return fmt.Errorf("put object %q: %w", a.ID, err)
 	}
 	return nil
 }
 
-// get returns (nil, nil) when the object does not exist.
-func (s *Storage) get(ctx context.Context, key string) (*storedObject, error) {
+// head returns (nil, nil) when the asset does not exist.
+func (s *Storage) head(ctx context.Context, id string) (*Asset, error) {
+	out, err := s.client.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(s.key(id)),
+	})
+	if isNotFound(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("head object %q: %w", id, err)
+	}
+	return assetFromObject(id, aws.ToString(out.ContentType), aws.ToInt64(out.ContentLength), aws.ToTime(out.LastModified), out.Metadata), nil
+}
+
+// get returns the asset and an open body, or (nil, nil, nil) when it does not exist.
+func (s *Storage) get(ctx context.Context, id string) (*Asset, io.ReadCloser, error) {
 	out, err := s.client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(s.bucket),
-		Key:    aws.String(key),
+		Key:    aws.String(s.key(id)),
 	})
+	if isNotFound(err) {
+		return nil, nil, nil
+	}
 	if err != nil {
-		var noSuchKey *types.NoSuchKey
-		if errors.As(err, &noSuchKey) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("get object %q: %w", key, err)
+		return nil, nil, fmt.Errorf("get object %q: %w", id, err)
 	}
-	obj := &storedObject{Body: out.Body, ContentType: "application/octet-stream", Size: -1}
-	if out.ContentType != nil {
-		obj.ContentType = *out.ContentType
-	}
-	if out.ContentLength != nil {
-		obj.Size = *out.ContentLength
-	}
-	return obj, nil
+	asset := assetFromObject(id, aws.ToString(out.ContentType), aws.ToInt64(out.ContentLength), aws.ToTime(out.LastModified), out.Metadata)
+	return asset, out.Body, nil
 }
 
-func (s *Storage) getBytes(ctx context.Context, key string) ([]byte, error) {
-	obj, err := s.get(ctx, key)
-	if err != nil {
-		return nil, err
-	}
-	if obj == nil {
-		return nil, fmt.Errorf("get object %q: not found", key)
-	}
-	defer obj.Body.Close()
-	return io.ReadAll(obj.Body)
-}
-
-func (s *Storage) delete(ctx context.Context, key string) error {
+func (s *Storage) delete(ctx context.Context, id string) error {
 	_, err := s.client.DeleteObject(ctx, &s3.DeleteObjectInput{
 		Bucket: aws.String(s.bucket),
-		Key:    aws.String(key),
+		Key:    aws.String(s.key(id)),
 	})
 	if err != nil {
-		return fmt.Errorf("delete object %q: %w", key, err)
+		return fmt.Errorf("delete object %q: %w", id, err)
 	}
 	return nil
 }
 
-func (s *Storage) listKeys(ctx context.Context, prefix string) ([]string, error) {
-	var keys []string
+type listedObject struct {
+	ID       string
+	Modified time.Time
+}
+
+// listIDs returns every asset ID, newest first. Listing doesn't return user metadata, so
+// callers HEAD the page they show.
+func (s *Storage) listIDs(ctx context.Context) ([]listedObject, error) {
+	var objects []listedObject
 	pages := s3.NewListObjectsV2Paginator(s.client, &s3.ListObjectsV2Input{
 		Bucket: aws.String(s.bucket),
-		Prefix: aws.String(prefix),
+		Prefix: aws.String(s.prefix),
 	})
 	for pages.HasMorePages() {
 		page, err := pages.NextPage(ctx)
 		if err != nil {
-			return nil, fmt.Errorf("list objects %q: %w", prefix, err)
+			return nil, fmt.Errorf("list objects: %w", err)
 		}
 		for _, obj := range page.Contents {
-			keys = append(keys, aws.ToString(obj.Key))
-		}
-	}
-	return keys, nil
-}
-
-func (s *Storage) maskKey(id, model, transformVersion string) string {
-	return s.variantPrefix(id) + "mask-" + model + "-v" + transformVersion + ".png"
-}
-
-// deletePrefix deletes objects one by one; DeleteObjects needs Content-MD5, which some providers handle poorly.
-func (s *Storage) deletePrefix(ctx context.Context, prefix string) error {
-	pages := s3.NewListObjectsV2Paginator(s.client, &s3.ListObjectsV2Input{
-		Bucket: aws.String(s.bucket),
-		Prefix: aws.String(prefix),
-	})
-	for pages.HasMorePages() {
-		page, err := pages.NextPage(ctx)
-		if err != nil {
-			return fmt.Errorf("list objects %q: %w", prefix, err)
-		}
-		for _, obj := range page.Contents {
-			if err := s.delete(ctx, aws.ToString(obj.Key)); err != nil {
-				return err
+			id := strings.TrimPrefix(aws.ToString(obj.Key), s.prefix)
+			if isValidID(id) {
+				objects = append(objects, listedObject{ID: id, Modified: aws.ToTime(obj.LastModified)})
 			}
 		}
 	}
-	return nil
+	sort.Slice(objects, func(i, j int) bool {
+		if !objects[i].Modified.Equal(objects[j].Modified) {
+			return objects[i].Modified.After(objects[j].Modified)
+		}
+		return objects[i].ID > objects[j].ID
+	})
+	return objects, nil
 }

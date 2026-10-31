@@ -22,7 +22,7 @@ async function api(path, options = {}) {
   return res.status === 204 ? null : res.json();
 }
 
-// Delivery URLs are shown absolute but loaded same-origin, so the session cookie covers private assets.
+// Delivery URLs are shown absolute but previewed same-origin.
 const localPath = (url) => {
   const u = new URL(url, location.href);
   return u.pathname + u.search;
@@ -77,7 +77,7 @@ function tile(asset) {
   label.textContent = asset.filename;
   const badge = document.createElement("span");
   badge.className = "badge";
-  badge.textContent = `${asset.width}×${asset.height} · ${asset.visibility}`;
+  badge.textContent = `${asset.width}×${asset.height}`;
   button.append(img, label, badge);
   button.addEventListener("click", () => openDetail(asset));
   return button;
@@ -177,8 +177,7 @@ async function buildURL() {
 
 function openDetail(asset) {
   current = asset;
-  $("d-filename").value = asset.filename;
-  $("d-visibility").value = asset.visibility;
+  $("d-filename").textContent = asset.filename;
   const kb = (asset.size_bytes / 1024).toFixed(0);
   $("d-meta").textContent = `${asset.id} · ${asset.content_type} · ${asset.width}×${asset.height} · ${kb} KB · ${asset.created_at}`;
   for (const id of builderFields) {
@@ -200,29 +199,6 @@ $("b-copy").addEventListener("click", async () => {
   await navigator.clipboard.writeText($("b-url").value);
   $("b-copy").textContent = "Copied";
   setTimeout(() => ($("b-copy").textContent = "Copy"), 1200);
-});
-
-$("d-save").addEventListener("click", async () => {
-  try {
-    current = await api(`/assets/${current.id}`, {
-      method: "PATCH",
-      json: { filename: $("d-filename").value, visibility: $("d-visibility").value },
-    });
-    $("detail").close();
-    loadPage(true);
-  } catch (err) {
-    alert(err.message);
-  }
-});
-
-$("d-share").addEventListener("click", async () => {
-  try {
-    const body = { expires_in: 86400, transforms: transformsString() };
-    const result = await api(`/assets/${current.id}/share`, { method: "POST", json: body });
-    $("b-url").value = result.url;
-  } catch (err) {
-    alert(err.message);
-  }
 });
 
 $("d-delete").addEventListener("click", async () => {

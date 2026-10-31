@@ -1,4 +1,4 @@
-# Local development: an S3-compatible store, Postgres and the API.
+# Local development: an S3-compatible store and the API.
 #   docker compose up --build
 #   API: http://localhost:8081
 
@@ -10,8 +10,7 @@ x-api-env: &api-env
   S3_SECRET_ACCESS_KEY: dev-secret
   S3_USE_PATH_STYLE: "true"
   SIGNING_SECRET: dev-signing-secret-at-least-32-characters
-  PICAPI_BOOTSTRAP_KEY: dev-api-key-0123456789abcdefghijklmn
-  DATABASE_URL: postgres://picapi:picapi@postgres:5432/picapi?sslmode=disable
+  PICAPI_API_KEY: dev-api-key-0123456789abcdefghijklmn
   BG_MODEL: u2netp
 
 services:
@@ -24,21 +23,6 @@ services:
       - s3-data:/data
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8333/picapi"]
-      interval: 2s
-      retries: 30
-
-  postgres:
-    image: postgres:18
-    environment:
-      POSTGRES_USER: picapi
-      POSTGRES_PASSWORD: picapi
-      POSTGRES_DB: picapi
-    ports:
-      - "5433:5432"
-    volumes:
-      - pg-data:/var/lib/postgresql
-    healthcheck:
-      test: ["CMD", "pg_isready", "-U", "picapi"]
       interval: 2s
       retries: 30
 
@@ -55,9 +39,6 @@ services:
     depends_on:
       s3:
         condition: service_healthy
-      postgres:
-        condition: service_healthy
 
 volumes:
   s3-data:
-  pg-data:

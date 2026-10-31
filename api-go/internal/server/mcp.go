@@ -35,21 +35,13 @@ type mcpListOutput struct {
 }
 
 type mcpUploadURLInput struct {
-	URL        string `json:"url" jsonschema:"http(s) URL of the image to import"`
-	Filename   string `json:"filename,omitempty" jsonschema:"filename to store; defaults to the URL's last path segment"`
-	Visibility string `json:"visibility,omitempty" jsonschema:"public (default) or private"`
+	URL      string `json:"url" jsonschema:"http(s) URL of the image to import"`
+	Filename string `json:"filename,omitempty" jsonschema:"filename to store; defaults to the URL's last path segment"`
 }
 
 type mcpUploadDataInput struct {
-	Data       string `json:"data" jsonschema:"base64-encoded image bytes"`
-	Filename   string `json:"filename" jsonschema:"filename to store"`
-	Visibility string `json:"visibility,omitempty" jsonschema:"public (default) or private"`
-}
-
-type mcpUpdateInput struct {
-	ID         string  `json:"id" jsonschema:"the asset ID"`
-	Filename   *string `json:"filename,omitempty" jsonschema:"new filename"`
-	Visibility *string `json:"visibility,omitempty" jsonschema:"public or private"`
+	Data     string `json:"data" jsonschema:"base64-encoded image bytes"`
+	Filename string `json:"filename" jsonschema:"filename to store"`
 }
 
 type mcpURLInput struct {
@@ -61,12 +53,6 @@ type mcpURLInput struct {
 
 type mcpURLOutput struct {
 	URL string `json:"url"`
-}
-
-type mcpShareInput struct {
-	ID         string `json:"id" jsonschema:"the asset ID"`
-	Transforms string `json:"transforms,omitempty" jsonschema:"optional transforms, as for get_url"`
-	ExpiresIn  int64  `json:"expires_in,omitempty" jsonschema:"seconds until the link expires (default 3600, max 2592000)"`
 }
 
 type mcpRemoveBGInput struct {
@@ -91,17 +77,11 @@ func (s *Server) mcpHandler() http.Handler {
 			if limit < 1 || limit > 100 {
 				return nil, mcpListOutput{}, errors.New("limit must be from 1 to 100")
 			}
-			rows, err := s.db.listAssets(ctx, limit+1, in.Cursor)
+			items, next, err := s.listAssetPage(ctx, limit, in.Cursor)
 			if err != nil {
-				return nil, mcpListOutput{}, err
+				return nil, mcpListOutput{}, mcpError(err)
 			}
-			out := mcpListOutput{Items: []assetJSON{}}
-			for i := 0; i < len(rows) && i < limit; i++ {
-				out.Items = append(out.Items, s.assetJSON(&rows[i]))
-			}
-			if len(rows) > limit {
-				out.NextCursor = out.Items[len(out.Items)-1].ID
-			}
+			out := mcpListOutput{Items: items, NextCursor: next}
 			return nil, out, nil
 		})
 
@@ -123,7 +103,7 @@ func (s *Server) mcpHandler() http.Handler {
 			if in.Filename != "" {
 				name = in.Filename
 			}
-			asset, err := s.createAsset(ctx, buf, name, in.Visibility)
+			asset, err := s.createAsset(ctx, buf, name)
 			if err != nil {
 				return nil, assetJSON{}, mcpError(err)
 			}
@@ -136,24 +116,11 @@ func (s *Server) mcpHandler() http.Handler {
 			if err != nil {
 				return nil, assetJSON{}, errors.New("data must be standard base64")
 			}
-			asset, err := s.createAsset(ctx, buf, in.Filename, in.Visibility)
+			asset, err := s.createAsset(ctx, buf, in.Filename)
 			if err != nil {
 				return nil, assetJSON{}, mcpError(err)
 			}
 			return nil, s.assetJSON(asset), nil
-		})
-
-	mcp.AddTool(server, &mcp.Tool{Name: "update_asset", Description: "Rename an asset or change its visibility."},
-		func(ctx context.Context, _ *mcp.CallToolRequest, in mcpUpdateInput) (*mcp.CallToolResult, assetJSON, error) {
-			asset, err := s.lookupAsset(ctx, in.ID)
-			if err != nil {
-				return nil, assetJSON{}, mcpError(err)
-			}
-			updated, err := s.updateAsset(ctx, asset, in.Filename, in.Visibility)
-			if err != nil {
-				return nil, assetJSON{}, mcpError(err)
-			}
-			return nil, s.assetJSON(updated), nil
 		})
 
 	mcp.AddTool(server, &mcp.Tool{Name: "delete_asset", Description: "Delete an asset and all its variants."},
@@ -186,26 +153,6 @@ func (s *Server) mcpHandler() http.Handler {
 				return nil, mcpURLOutput{}, mcpError(err)
 			}
 			return nil, mcpURLOutput{URL: built}, nil
-		})
-
-	mcp.AddTool(server, &mcp.Tool{Name: "share_asset", Description: "Create a time-limited link that works for private assets."},
-		func(ctx context.Context, _ *mcp.CallToolRequest, in mcpShareInput) (*mcp.CallToolResult, shareResult, error) {
-			asset, err := s.lookupAsset(ctx, in.ID)
-			if err != nil {
-				return nil, shareResult{}, mcpError(err)
-			}
-			seconds := in.ExpiresIn
-			if seconds == 0 {
-				seconds = 3600
-			}
-			if seconds < 1 || seconds > maxShareSeconds {
-				return nil, shareResult{}, fmt.Errorf("expires_in must be from 1 to %d", maxShareSeconds)
-			}
-			result, err := s.share(asset, in.Transforms, "", seconds)
-			if err != nil {
-				return nil, shareResult{}, mcpError(err)
-			}
-			return nil, result, nil
 		})
 
 	mcp.AddTool(server, &mcp.Tool{Name: "remove_background", Description: "Get a signed URL for the asset with its background removed (transparent PNG by default). The first request takes a few seconds."},

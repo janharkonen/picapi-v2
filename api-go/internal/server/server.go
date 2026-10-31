@@ -1,5 +1,5 @@
 // Package server implements the picapi HTTP server: management API, image delivery,
-// MCP endpoint and web UI.
+// MCP endpoint and web UI. The S3 bucket is its only storage.
 package server
 
 import (
@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
-	"sync"
 
 	"github.com/davidbyttow/govips/v2/vips"
 	"github.com/labstack/echo/v5"
@@ -20,14 +19,11 @@ import (
 type Server struct {
 	cfg        Config
 	logger     *slog.Logger
-	db         *DB
 	storage    *Storage
 	purger     *purger
 	bg         *bgRemover
 	transforms chan struct{} // semaphore
 	inflight   singleflight.Group
-	storing    sync.Map
-	servedSeen seenSet
 }
 
 // Run starts the server and blocks until ctx is cancelled.
@@ -38,34 +34,17 @@ func Run(ctx context.Context, cfg Config, logger *slog.Logger) error {
 	}
 	defer vips.Shutdown()
 
-	db, err := openDB(ctx, cfg.DatabaseURL)
-	if err != nil {
-		return err
-	}
-	defer db.Close()
-	if cfg.BootstrapKey != "" {
-		created, err := db.ensureBootstrapKey(ctx, cfg.BootstrapKey)
-		if err != nil {
-			return err
-		}
-		if created {
-			logger.Info("created bootstrap API key")
-		}
-	}
-
 	s := &Server{
 		cfg:        cfg,
 		logger:     logger,
-		db:         db,
 		storage:    newStorage(cfg.S3),
 		purger:     newPurger(cfg),
 		bg:         newBGRemover(cfg),
 		transforms: make(chan struct{}, cfg.TransformConcurrency),
 	}
-	go s.runJanitor(ctx)
 
 	logger.Info("picapi starting",
-		"s3_endpoint", cfg.S3.Endpoint, "bucket", cfg.S3.Bucket, "prefix", cfg.S3.EnvPrefix,
+		"s3_endpoint", cfg.S3.Endpoint, "bucket", cfg.S3.Bucket, "prefix", s.storage.prefix,
 		"cloudflare_purge", s.purger.enabled(), "bg_model", cfg.BGModel)
 	sc := echo.StartConfig{Address: ":" + strconv.Itoa(cfg.Port), HideBanner: true}
 	if err := sc.Start(ctx, s.routes()); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -85,12 +64,8 @@ func (s *Server) routes() *echo.Echo {
 			if v.Status >= 500 {
 				level = slog.LevelError
 			}
-			uri := v.URI
-			if i := strings.Index(uri, "token="); i >= 0 {
-				uri = uri[:i] + "token=REDACTED"
-			}
 			s.logger.Log(c.Request().Context(), level, "request",
-				"method", v.Method, "uri", uri, "status", v.Status, "latency", v.Latency)
+				"method", v.Method, "uri", v.URI, "status", v.Status, "latency", v.Latency)
 			return nil
 		},
 	}))
@@ -109,14 +84,8 @@ func (s *Server) routes() *echo.Echo {
 	api.POST("/assets", s.uploadAsset, middleware.BodyLimit(s.cfg.MaxUploadBytes+1024*1024))
 	api.GET("/assets", s.listAssets)
 	api.GET("/assets/:id", s.getAsset)
-	api.PATCH("/assets/:id", s.patchAsset)
 	api.DELETE("/assets/:id", s.deleteAsset)
 	api.POST("/assets/:id/url", s.assetURL)
-	api.POST("/assets/:id/share", s.shareAsset)
-	api.GET("/keys", s.listKeys)
-	api.POST("/keys", s.createKey)
-	api.DELETE("/keys/:id", s.revokeKey)
-	api.POST("/admin/reconcile", s.reconcileHandler)
 
 	mcpHandler := echo.WrapHandler(s.mcpHandler())
 	for _, method := range []string{http.MethodGet, http.MethodPost, http.MethodDelete} {

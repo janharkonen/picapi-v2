@@ -18,7 +18,6 @@ type Asset = {
   width: number;
   height: number;
   sha256: string;
-  visibility: "public" | "private";
   created_at: string;
   url: string;
 };
@@ -103,9 +102,9 @@ describe("upload", () => {
     assert.equal(photo.content_type, "image/jpeg");
     assert.equal(photo.width, 1600);
     assert.equal(photo.height, 1000);
-    assert.equal(photo.visibility, "public");
     assert.match(photo.sha256, /^[0-9a-f]{64}$/);
     assert.match(photo.created_at, /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/);
+    assert.ok(!("visibility" in photo));
     assert.equal(photo.url, `${baseUrl}/i/${photo.id}`);
   });
 
@@ -122,9 +121,8 @@ describe("upload", () => {
     assert.equal(out.height, 192);
   });
 
-  test("accepts visibility and filename fields", async () => {
-    const asset = await uploadOk(await solid(10, 10), "x.jpg", { visibility: "private", filename: "dir/name.jpg" });
-    assert.equal(asset.visibility, "private");
+  test("accepts a filename field", async () => {
+    const asset = await uploadOk(await solid(10, 10), "x.jpg", { filename: "dir/name.jpg" });
     assert.equal(asset.filename, "name.jpg");
   });
 
@@ -135,7 +133,6 @@ describe("upload", () => {
     form.append("other", "x");
     await expectError(await api("/assets", { method: "POST", body: form }), 400);
     await expectError(await upload(Buffer.from([0xff, 0xd8, 0xff, 0x00, 0x01]), "broken.jpg"), 400);
-    await expectError(await upload(await solid(10, 10), "x.jpg", { visibility: "secret" }), 400);
   });
 });
 
@@ -149,35 +146,28 @@ describe("asset management", () => {
   });
 
   test("list paginates newest first", async () => {
+    // The bucket's LastModified has one-second resolution.
     const a = await uploadOk(await solid(8, 8), "a.jpg");
+    await new Promise((resolve) => setTimeout(resolve, 1100));
     const b = await uploadOk(await solid(8, 8), "b.jpg");
     const first = (await (await api("/assets?limit=1")).json()) as { items: Asset[]; next_cursor: string | null };
     assert.equal(first.items.length, 1);
     assert.equal(first.items[0]!.id, b.id);
     assert.equal(first.next_cursor, b.id);
     const second = (await (await api(`/assets?limit=1&cursor=${first.next_cursor}`)).json()) as { items: Asset[] };
-    assert.equal(second.items[0]!.id, a.id);
+    assert.equal(second.items.length, 1);
+    assert.notEqual(second.items[0]!.id, b.id);
 
     const all = (await (await api("/assets?limit=100")).json()) as { items: Asset[]; next_cursor: string | null };
-    assert.ok(all.items.some((item) => item.id === photo.id));
+    const ids = all.items.map((item) => item.id);
+    assert.ok(ids.includes(photo.id));
+    assert.ok(ids.indexOf(b.id) < ids.indexOf(a.id), "newer uploads come first");
 
     await expectError(await api("/assets?limit=0"), 400);
     await expectError(await api("/assets?limit=101"), 400);
     await expectError(await api("/assets?limit=abc"), 400);
     await expectError(await api("/assets?cursor=AAAAAAAAAAAA"), 400);
-  });
-
-  test("patch filename and visibility", async () => {
-    const asset = await uploadOk(await solid(8, 8), "before.jpg");
-    const res = await postJson(`/assets/${asset.id}`, { filename: "after.jpg", visibility: "private" }, "PATCH");
-    assert.equal(res.status, 200);
-    const updated = (await res.json()) as Asset;
-    assert.equal(updated.filename, "after.jpg");
-    assert.equal(updated.visibility, "private");
-    await expectError(await postJson(`/assets/${asset.id}`, {}, "PATCH"), 400);
-    await expectError(await postJson(`/assets/${asset.id}`, { visibility: "hidden" }, "PATCH"), 400);
-    await expectError(await postJson(`/assets/${asset.id}`, { filename: 5 }, "PATCH"), 400);
-    await expectError(await api(`/assets/${asset.id}`, { method: "PATCH", body: "{oops" }), 400);
+    await expectError(await api("/assets?cursor=bad"), 400);
   });
 
   test("delete", async () => {
@@ -243,19 +233,16 @@ describe("delivery: transforms", () => {
     assert.deepEqual([out.format, out.width, out.height], ["webp", 320, 200]);
   });
 
-  test("second request is served from the bucket cache", async () => {
+  test("variants are rendered on every request and never stored", async () => {
     const path = `/i/${photo.id}/w_480,f_avif,q_60`;
-    assert.equal((await get(path)).headers.get("x-picapi-cache"), "miss");
-    let cache: string | null = null;
-    for (let i = 0; i < 20 && cache !== "hit"; i++) {
-      await new Promise((resolve) => setTimeout(resolve, 100));
+    for (let i = 0; i < 2; i++) {
       const res = await get(path);
-      cache = res.headers.get("x-picapi-cache");
-      await res.arrayBuffer();
+      assert.equal(res.status, 200);
+      assert.equal(res.headers.get("x-picapi-cache"), null);
+      assert.match(res.headers.get("server-timing")!, /^transform;dur=\d+(\.\d)?$/);
+      const out = await imageOf(res);
+      assert.deepEqual([out.format, out.width, out.height], ["heif", 480, 300]);
     }
-    assert.equal(cache, "hit");
-    const out = await imageOf(await get(path));
-    assert.deepEqual([out.format, out.width, out.height], ["heif", 480, 300]);
   });
 
   test("variant 304", async () => {
@@ -400,7 +387,9 @@ describe("signed URLs", () => {
     const res = await postJson(`/assets/${photo.id}/url`, { transforms: "w_320", expires_in: 1 });
     const { url } = (await res.json()) as { url: string };
     assert.match(url, /\?exp=\d+&s=/);
-    assert.equal((await get(url)).status, 200);
+    const fresh = await get(url);
+    assert.equal(fresh.status, 200);
+    assert.match(fresh.headers.get("cache-control")!, /^public, max-age=[01]$/);
     await new Promise((resolve) => setTimeout(resolve, 2100));
     await expectError(await get(url), 403);
     await expectError(await postJson(`/assets/${photo.id}/url`, { expires_in: 0 }), 400);
@@ -446,30 +435,6 @@ describe("background removal", () => {
   });
 });
 
-describe("API keys", () => {
-  test("create, use and revoke", async () => {
-    const list = (await (await api("/keys")).json()) as { items: { id: string; name: string; revoked_at: string | null }[] };
-    assert.ok(list.items.length >= 1);
-
-    const res = await postJson("/keys", { name: "conformance" });
-    assert.equal(res.status, 201);
-    const created = (await res.json()) as { id: string; name: string; key: string };
-    assert.match(created.key, /^pk_[0-9A-Za-z]{40}$/);
-    assert.equal(created.name, "conformance");
-
-    const withNewKey = await fetch(`${baseUrl}/api/v1/assets?limit=1`, { headers: { Authorization: `Bearer ${created.key}` } });
-    assert.equal(withNewKey.status, 200);
-
-    const keys = (await (await api("/keys")).json()) as { items: { id: string; key?: string }[] };
-    assert.ok(keys.items.every((k) => k.key === undefined), "keys are never listed");
-
-    assert.equal((await api(`/keys/${created.id}`, { method: "DELETE" })).status, 204);
-    await expectError(await fetch(`${baseUrl}/api/v1/assets`, { headers: { Authorization: `Bearer ${created.key}` } }), 401);
-    await expectError(await api(`/keys/${created.id}`, { method: "DELETE" }), 404);
-    await expectError(await postJson("/keys", { name: "" }), 400);
-  });
-});
-
 describe("web UI session", () => {
   test("login with a key gives a cookie session", async () => {
     await expectError(await fetch(`${baseUrl}/api/v1/session`, { method: "POST", body: JSON.stringify({ key: "nope" }) }), 401);
@@ -486,21 +451,12 @@ describe("web UI session", () => {
     assert.equal(((await info.json()) as { auth: string }).auth, "session");
 
     // Writes with a cookie need the CSRF header.
-    const asset = await uploadOk(await solid(20, 20), "session.jpg", { visibility: "private" });
-    const patch = (headers: Record<string, string>) =>
-      fetch(`${baseUrl}/api/v1/assets/${asset.id}`, {
-        method: "PATCH",
-        headers: { Cookie: cookie, "Content-Type": "application/json", ...headers },
-        body: JSON.stringify({ filename: "renamed.jpg" }),
-      });
-    await expectError(await patch({}), 403);
-    assert.equal((await patch({ "X-Picapi-CSRF": "1" })).status, 200);
-
-    // The UI can show private assets with its cookie.
-    const priv = await get(`/i/${asset.id}/w_64`, { headers: { Cookie: cookie } });
-    assert.equal(priv.status, 200);
-    assert.equal(priv.headers.get("cache-control"), "private, max-age=300");
-    await expectError(await get(`/i/${asset.id}/w_64`, { headers: { Cookie: "picapi_session=forged.1.x" } }), 403);
+    const asset = await uploadOk(await solid(20, 20), "session.jpg");
+    const del = (headers: Record<string, string>) =>
+      fetch(`${baseUrl}/api/v1/assets/${asset.id}`, { method: "DELETE", headers: { Cookie: cookie, ...headers } });
+    await expectError(await del({}), 403);
+    assert.equal((await del({ "X-Picapi-CSRF": "1" })).status, 204);
+    await expectError(await fetch(`${baseUrl}/api/v1/session`, { headers: { Cookie: "picapi_session=1.forged" } }), 401);
 
     const logout = await fetch(`${baseUrl}/api/v1/session`, { method: "DELETE", headers: { Cookie: cookie } });
     assert.equal(logout.status, 204);
@@ -514,19 +470,6 @@ describe("web UI session", () => {
     assert.match(res.headers.get("content-security-policy")!, /default-src 'self'/);
     assert.match(await res.text(), /<title>picapi<\/title>/);
     assert.equal((await get("/app.js")).status, 200);
-  });
-});
-
-describe("reconcile", () => {
-  test("reports bucket and database consistency", async () => {
-    const res = await api("/admin/reconcile", { method: "POST" });
-    assert.equal(res.status, 200);
-    const report = (await res.json()) as Record<string, unknown>;
-    assert.equal(report.fixed, false);
-    for (const key of ["orphan_originals", "missing_originals", "orphan_variants", "stale_variant_rows"]) {
-      assert.ok(Array.isArray(report[key]), key);
-    }
-    assert.deepEqual(report.missing_originals, []);
   });
 });
 
@@ -559,7 +502,8 @@ describe("MCP", () => {
 
     const list = (await (await rpc("tools/list")).json()) as { result: { tools: { name: string }[] } };
     const names = list.result.tools.map((t) => t.name).sort();
-    for (const name of ["delete_asset", "get_asset", "get_url", "list_assets", "remove_background", "share_asset", "update_asset", "upload_data", "upload_from_url"]) {
+    assert.deepEqual(names, ["delete_asset", "get_asset", "get_url", "list_assets", "remove_background", "upload_data", "upload_from_url"]);
+    for (const name of names) {
       assert.ok(names.includes(name), `missing tool ${name}`);
     }
 
@@ -588,34 +532,3 @@ describe("MCP", () => {
   });
 });
 
-describe("private assets", () => {
-  test("need a valid token", async () => {
-    const asset = await uploadOk(await solid(200, 100), "private.jpg", { visibility: "private" });
-    await expectError(await get(`/i/${asset.id}`), 403);
-    await expectError(await get(`/i/${asset.id}?token=garbage`), 403);
-
-    const res = await postJson(`/assets/${asset.id}/share`, { expires_in: 600, transforms: "w_64" });
-    assert.equal(res.status, 200);
-    const share = (await res.json()) as { url: string; token: string; expires_at: string };
-    assert.equal(share.url, `${baseUrl}/i/${asset.id}/w_64?token=${share.token}`);
-    assert.match(share.expires_at, /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/);
-
-    const ok = await get(share.url);
-    assert.equal(ok.status, 200);
-    assert.match(ok.headers.get("cache-control")!, /^private, max-age=(59\d|600)$/);
-    assert.equal(ok.headers.get("referrer-policy"), "no-referrer");
-    assert.equal((await imageOf(ok)).width, 64);
-
-    // Tokens are bound to one asset.
-    const other = await uploadOk(await solid(10, 10), "other.jpg", { visibility: "private" });
-    await expectError(await get(`/i/${other.id}?token=${share.token}`), 403);
-
-    // Redirects of private URLs are not cached.
-    const redirect = await get(`/i/${asset.id}?w=64&token=${share.token}`);
-    assert.equal(redirect.status, 301);
-    assert.equal(redirect.headers.get("cache-control"), "no-store");
-    assert.equal(redirect.headers.get("location"), `/i/${asset.id}/w_64?token=${share.token}`);
-
-    await expectError(await postJson(`/assets/${asset.id}/share`, { expires_in: 30 * 24 * 3600 + 1 }), 400);
-  });
-});

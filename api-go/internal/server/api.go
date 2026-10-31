@@ -13,14 +13,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/golang-jwt/jwt/v5"
 	"github.com/labstack/echo/v5"
+	"golang.org/x/sync/errgroup"
 )
 
-const (
-	yearSeconds     = 31536000
-	maxShareSeconds = 30 * 24 * 3600
-)
+const yearSeconds = 31536000
 
 type assetJSON struct {
 	ID          string `json:"id"`
@@ -30,7 +27,6 @@ type assetJSON struct {
 	Width       int    `json:"width"`
 	Height      int    `json:"height"`
 	SHA256      string `json:"sha256"`
-	Visibility  string `json:"visibility"`
 	CreatedAt   string `json:"created_at"`
 	URL         string `json:"url"`
 }
@@ -44,22 +40,9 @@ func (s *Server) assetJSON(a *Asset) assetJSON {
 		Width:       a.Width,
 		Height:      a.Height,
 		SHA256:      a.SHA256,
-		Visibility:  a.Visibility,
-		CreatedAt:   formatTime(a.CreatedAt),
+		CreatedAt:   a.CreatedAt.UTC().Format("2006-01-02T15:04:05.000Z"),
 		URL:         s.cfg.PublicBaseURL + "/i/" + a.ID,
 	}
-}
-
-func formatTime(t time.Time) string {
-	return t.UTC().Format("2006-01-02T15:04:05.000Z")
-}
-
-func formatTimePtr(t *time.Time) *string {
-	if t == nil {
-		return nil
-	}
-	s := formatTime(*t)
-	return &s
 }
 
 func httpError(code int, message string) error {
@@ -72,7 +55,7 @@ func (s *Server) lookupAsset(ctx context.Context, id string) (*Asset, error) {
 	if !isValidID(id) {
 		return nil, httpError(http.StatusNotFound, "asset not found")
 	}
-	asset, err := s.db.getAsset(ctx, id)
+	asset, err := s.storage.head(ctx, id)
 	if err != nil {
 		return nil, err
 	}
@@ -82,96 +65,103 @@ func (s *Server) lookupAsset(ctx context.Context, id string) (*Asset, error) {
 	return asset, nil
 }
 
-func (s *Server) createAsset(ctx context.Context, buf []byte, filename, visibility string) (*Asset, error) {
+func (s *Server) createAsset(ctx context.Context, buf []byte, filename string) (*Asset, error) {
 	if len(buf) == 0 {
 		return nil, httpError(http.StatusBadRequest, "file is empty")
 	}
 	if int64(len(buf)) > s.cfg.MaxUploadBytes {
 		return nil, httpError(http.StatusRequestEntityTooLarge, "upload is too large")
 	}
-	if visibility == "" {
-		visibility = "public"
-	}
-	if err := validateVisibility(visibility); err != nil {
-		return nil, err
-	}
 	info, err := probe(buf, s.cfg.MaxInputPixels)
 	if err != nil {
 		return nil, err
 	}
-
-	now := time.Now()
-	asset := Asset{
+	asset := &Asset{
 		Filename:    sanitizeFilename(filename),
 		ContentType: info.ContentType,
 		SizeBytes:   int64(len(buf)),
 		Width:       info.Width,
 		Height:      info.Height,
 		SHA256:      sha256Hex(buf),
-		Visibility:  visibility,
-		CreatedAt:   now,
-		UpdatedAt:   now,
 	}
-	// The object is written first; a crash leaves an orphan object, never a row without bytes.
 	for {
 		asset.ID = newID()
-		exists, err := s.db.assetExists(ctx, asset.ID)
+		existing, err := s.storage.head(ctx, asset.ID)
 		if err != nil {
 			return nil, err
 		}
-		if exists {
-			continue
-		}
-		err = s.storage.put(ctx, s.storage.originalKey(asset.ID), buf, info.ContentType, map[string]string{
-			"picapi-id":       asset.ID,
-			"picapi-filename": url.PathEscape(asset.Filename),
-		})
-		if err != nil {
-			return nil, err
-		}
-		inserted, err := s.db.insertAsset(ctx, asset)
-		if err != nil {
-			return nil, err
-		}
-		if inserted {
-			return &asset, nil
+		if existing == nil {
+			break
 		}
 	}
-}
-
-// updateAsset changes filename and/or visibility. Going private purges the CDN.
-func (s *Server) updateAsset(ctx context.Context, asset *Asset, filename, visibility *string) (*Asset, error) {
-	if filename == nil && visibility == nil {
-		return nil, httpError(http.StatusBadRequest, "nothing to update; send filename and/or visibility")
-	}
-	if filename != nil {
-		name := sanitizeFilename(*filename)
-		filename = &name
-	}
-	if visibility != nil {
-		if err := validateVisibility(*visibility); err != nil {
-			return nil, err
-		}
-	}
-	if err := s.db.updateAsset(ctx, asset.ID, filename, visibility); err != nil {
+	if err := s.storage.put(ctx, asset, buf); err != nil {
 		return nil, err
 	}
-	if visibility != nil && *visibility == "private" && asset.Visibility == "public" {
-		go func() {
-			if err := s.purgeAsset(context.Background(), asset.ID); err != nil {
-				s.logger.Error("purging asset failed", "asset", asset.ID, "error", err)
-			}
-		}()
-	}
+	// Read back so created_at is the bucket's LastModified, as in every later response.
 	return s.lookupAsset(ctx, asset.ID)
 }
 
+// removeAsset deletes the object and purges every cached URL of the asset.
 func (s *Server) removeAsset(ctx context.Context, asset *Asset) error {
-	if err := s.db.softDeleteAsset(ctx, asset.ID); err != nil {
+	if err := s.storage.delete(ctx, asset.ID); err != nil {
 		return err
 	}
-	go s.cleanupDeletedAsset(asset.ID)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+		if err := s.purger.purgeAsset(ctx, asset.ID); err != nil {
+			s.logger.Error("purging asset failed", "asset", asset.ID, "error", err)
+		}
+	}()
 	return nil
+}
+
+// listAssetPage returns up to limit assets after cursor (an asset ID), newest first.
+func (s *Server) listAssetPage(ctx context.Context, limit int, cursor string) ([]assetJSON, string, error) {
+	objects, err := s.storage.listIDs(ctx)
+	if err != nil {
+		return nil, "", err
+	}
+	start := 0
+	if cursor != "" {
+		start = -1
+		for i, obj := range objects {
+			if obj.ID == cursor {
+				start = i + 1
+				break
+			}
+		}
+		if start < 0 {
+			return nil, "", httpError(http.StatusBadRequest, "invalid cursor")
+		}
+	}
+	end := min(start+limit, len(objects))
+	page := objects[start:end]
+
+	items := make([]assetJSON, len(page))
+	group, gctx := errgroup.WithContext(ctx)
+	group.SetLimit(16)
+	for i, obj := range page {
+		group.Go(func() error {
+			asset, err := s.storage.head(gctx, obj.ID)
+			if err != nil {
+				return err
+			}
+			if asset == nil { // deleted meanwhile
+				asset = &Asset{ID: obj.ID, Filename: obj.ID, CreatedAt: obj.Modified}
+			}
+			items[i] = s.assetJSON(asset)
+			return nil
+		})
+	}
+	if err := group.Wait(); err != nil {
+		return nil, "", err
+	}
+	next := ""
+	if end < len(objects) && len(page) > 0 {
+		next = page[len(page)-1].ID
+	}
+	return items, next, nil
 }
 
 // buildURL builds an absolute, canonical delivery URL, signed when the transforms need it
@@ -205,43 +195,7 @@ func (s *Server) buildURL(asset *Asset, transforms, slug string, exp int64) (str
 	return built, nil
 }
 
-type shareResult struct {
-	URL       string `json:"url"`
-	Token     string `json:"token"`
-	ExpiresAt string `json:"expires_at"`
-}
-
-func (s *Server) share(asset *Asset, transforms, slug string, seconds int64) (shareResult, error) {
-	now := time.Now().Unix()
-	exp := now + seconds
-	token, err := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"sub": asset.ID,
-		"iat": now,
-		"exp": exp,
-	}).SignedString([]byte(s.cfg.SigningSecret))
-	if err != nil {
-		return shareResult{}, err
-	}
-	built, err := s.buildURL(asset, transforms, slug, 0)
-	if err != nil {
-		return shareResult{}, err
-	}
-	sep := "?"
-	if strings.Contains(built, "?") {
-		sep = "&"
-	}
-	return shareResult{
-		URL:       built + sep + "token=" + url.QueryEscape(token),
-		Token:     token,
-		ExpiresAt: formatTime(time.Unix(exp, 0)),
-	}, nil
-}
-
 // ---- HTTP handlers ----
-
-func (s *Server) assetFromPath(c *echo.Context) (*Asset, error) {
-	return s.lookupAsset(c.Request().Context(), c.Param("id"))
-}
 
 func (s *Server) uploadAsset(c *echo.Context) error {
 	form, err := c.MultipartForm()
@@ -260,13 +214,6 @@ func (s *Server) uploadAsset(c *echo.Context) error {
 	if header.Size > s.cfg.MaxUploadBytes {
 		return httpError(http.StatusRequestEntityTooLarge, "upload is too large")
 	}
-	visibility := "public"
-	if values := form.Value["visibility"]; len(values) > 0 {
-		visibility = values[0]
-	}
-	if err := validateVisibility(visibility); err != nil {
-		return err
-	}
 	filename := header.Filename
 	if values := form.Value["filename"]; len(values) > 0 {
 		filename = values[0]
@@ -281,7 +228,7 @@ func (s *Server) uploadAsset(c *echo.Context) error {
 	if err != nil {
 		return err
 	}
-	asset, err := s.createAsset(c.Request().Context(), buf, filename, visibility)
+	asset, err := s.createAsset(c.Request().Context(), buf, filename)
 	if err != nil {
 		return err
 	}
@@ -291,76 +238,36 @@ func (s *Server) uploadAsset(c *echo.Context) error {
 var limitPattern = regexp.MustCompile(`^[0-9]+$`)
 
 func (s *Server) listAssets(c *echo.Context) error {
-	ctx := c.Request().Context()
 	limitRaw := c.QueryParamOr("limit", "50")
 	limit, _ := strconv.Atoi(limitRaw)
 	if !limitPattern.MatchString(limitRaw) || limit < 1 || limit > 100 {
 		return httpError(http.StatusBadRequest, "limit must be an integer from 1 to 100")
 	}
 	cursor := c.QueryParam("cursor")
-	if _, given := c.QueryParams()["cursor"]; given {
-		exists := false
-		if isValidID(cursor) {
-			var err error
-			if exists, err = s.db.assetExists(ctx, cursor); err != nil {
-				return err
-			}
-		}
-		if !exists {
-			return httpError(http.StatusBadRequest, "invalid cursor")
-		}
+	if _, given := c.QueryParams()["cursor"]; given && !isValidID(cursor) {
+		return httpError(http.StatusBadRequest, "invalid cursor")
 	}
-
-	rows, err := s.db.listAssets(ctx, limit+1, cursor)
+	items, next, err := s.listAssetPage(c.Request().Context(), limit, cursor)
 	if err != nil {
 		return err
 	}
-	items := make([]assetJSON, 0, limit)
-	for i := 0; i < len(rows) && i < limit; i++ {
-		items = append(items, s.assetJSON(&rows[i]))
+	var nextCursor *string
+	if next != "" {
+		nextCursor = &next
 	}
-	var next *string
-	if len(rows) > limit {
-		next = &items[len(items)-1].ID
-	}
-	return c.JSON(http.StatusOK, map[string]any{"items": items, "next_cursor": next})
+	return c.JSON(http.StatusOK, map[string]any{"items": items, "next_cursor": nextCursor})
 }
 
 func (s *Server) getAsset(c *echo.Context) error {
-	asset, err := s.assetFromPath(c)
+	asset, err := s.lookupAsset(c.Request().Context(), c.Param("id"))
 	if err != nil {
 		return err
 	}
 	return c.JSON(http.StatusOK, s.assetJSON(asset))
 }
 
-func (s *Server) patchAsset(c *echo.Context) error {
-	asset, err := s.assetFromPath(c)
-	if err != nil {
-		return err
-	}
-	body, err := readJSON(c)
-	if err != nil {
-		return err
-	}
-	filename, err := optionalString(body, "filename")
-	if err != nil {
-		return err
-	}
-	var visibility *string
-	if raw, ok := body["visibility"]; ok {
-		v, _ := raw.(string)
-		visibility = &v
-	}
-	updated, err := s.updateAsset(c.Request().Context(), asset, filename, visibility)
-	if err != nil {
-		return err
-	}
-	return c.JSON(http.StatusOK, s.assetJSON(updated))
-}
-
 func (s *Server) deleteAsset(c *echo.Context) error {
-	asset, err := s.assetFromPath(c)
+	asset, err := s.lookupAsset(c.Request().Context(), c.Param("id"))
 	if err != nil {
 		return err
 	}
@@ -371,7 +278,7 @@ func (s *Server) deleteAsset(c *echo.Context) error {
 }
 
 func (s *Server) assetURL(c *echo.Context) error {
-	asset, err := s.assetFromPath(c)
+	asset, err := s.lookupAsset(c.Request().Context(), c.Param("id"))
 	if err != nil {
 		return err
 	}
@@ -379,9 +286,13 @@ func (s *Server) assetURL(c *echo.Context) error {
 	if err != nil {
 		return err
 	}
-	transforms, slug, err := urlOptions(body)
+	transforms, err := optionalString(body, "transforms")
 	if err != nil {
 		return err
+	}
+	slug, err := optionalString(body, "slug")
+	if err != nil || (slug != "" && !isValidSlug(slug)) {
+		return httpError(http.StatusBadRequest, "invalid slug")
 	}
 	var exp int64
 	if raw, ok := body["expires_in"]; ok {
@@ -398,112 +309,6 @@ func (s *Server) assetURL(c *echo.Context) error {
 	return c.JSON(http.StatusOK, map[string]string{"url": built})
 }
 
-func (s *Server) shareAsset(c *echo.Context) error {
-	asset, err := s.assetFromPath(c)
-	if err != nil {
-		return err
-	}
-	body, err := readJSON(c)
-	if err != nil {
-		return err
-	}
-	transforms, slug, err := urlOptions(body)
-	if err != nil {
-		return err
-	}
-	seconds := int64(3600)
-	if raw, ok := body["expires_in"]; ok {
-		if seconds, err = parseSeconds(raw, maxShareSeconds); err != nil {
-			return err
-		}
-	}
-	result, err := s.share(asset, transforms, slug, seconds)
-	if err != nil {
-		return err
-	}
-	return c.JSON(http.StatusOK, result)
-}
-
-type keyJSON struct {
-	ID        string  `json:"id"`
-	Name      string  `json:"name"`
-	CreatedAt string  `json:"created_at"`
-	LastUsed  *string `json:"last_used"`
-	RevokedAt *string `json:"revoked_at"`
-	Key       string  `json:"key,omitempty"`
-}
-
-func toKeyJSON(k APIKey) keyJSON {
-	return keyJSON{ID: k.ID, Name: k.Name, CreatedAt: formatTime(k.CreatedAt), LastUsed: formatTimePtr(k.LastUsed), RevokedAt: formatTimePtr(k.RevokedAt)}
-}
-
-func (s *Server) listKeys(c *echo.Context) error {
-	keys, err := s.db.listKeys(c.Request().Context())
-	if err != nil {
-		return err
-	}
-	items := make([]keyJSON, len(keys))
-	for i, k := range keys {
-		items[i] = toKeyJSON(k)
-	}
-	return c.JSON(http.StatusOK, map[string]any{"items": items})
-}
-
-// createKey returns the new key once; only its hash is stored.
-func (s *Server) createKey(c *echo.Context) error {
-	body, err := readJSON(c)
-	if err != nil {
-		return err
-	}
-	name, _ := body["name"].(string)
-	name = strings.TrimSpace(name)
-	if name == "" || len([]rune(name)) > 100 {
-		return httpError(http.StatusBadRequest, "name must be 1 to 100 characters")
-	}
-	key := "pk_" + randomString(40)
-	created, err := s.db.createKey(c.Request().Context(), name, key)
-	if err != nil {
-		return err
-	}
-	out := toKeyJSON(created)
-	out.Key = key
-	return c.JSON(http.StatusCreated, out)
-}
-
-func (s *Server) revokeKey(c *echo.Context) error {
-	ctx := c.Request().Context()
-	count, err := s.db.activeKeyCount(ctx)
-	if err != nil {
-		return err
-	}
-	if count <= 1 {
-		active, err := s.db.isActiveKeyID(ctx, c.Param("id"))
-		if err != nil {
-			return err
-		}
-		if active {
-			return httpError(http.StatusConflict, "cannot revoke the last active key")
-		}
-	}
-	revoked, err := s.db.revokeKey(ctx, c.Param("id"))
-	if err != nil {
-		return err
-	}
-	if !revoked {
-		return httpError(http.StatusNotFound, "key not found")
-	}
-	return c.NoContent(http.StatusNoContent)
-}
-
-func (s *Server) reconcileHandler(c *echo.Context) error {
-	fix := c.QueryParam("fix") == "true"
-	report, err := s.reconcile(c.Request().Context(), fix)
-	if err != nil {
-		return err
-	}
-	return c.JSON(http.StatusOK, report)
-}
-
 // ---- Helpers ----
 
 func readJSON(c *echo.Context) (map[string]any, error) {
@@ -511,10 +316,6 @@ func readJSON(c *echo.Context) (map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
-	return parseJSONObject(raw)
-}
-
-func parseJSONObject(raw []byte) (map[string]any, error) {
 	if strings.TrimSpace(string(raw)) == "" {
 		return map[string]any{}, nil
 	}
@@ -529,41 +330,16 @@ func parseJSONObject(raw []byte) (map[string]any, error) {
 	return obj, nil
 }
 
-func optionalString(body map[string]any, key string) (*string, error) {
+func optionalString(body map[string]any, key string) (string, error) {
 	raw, ok := body[key]
 	if !ok {
-		return nil, nil
+		return "", nil
 	}
 	str, isString := raw.(string)
 	if !isString {
-		return nil, httpError(http.StatusBadRequest, key+" must be a string")
+		return "", httpError(http.StatusBadRequest, key+" must be a string")
 	}
-	return &str, nil
-}
-
-func urlOptions(body map[string]any) (transforms, slug string, err error) {
-	t, err := optionalString(body, "transforms")
-	if err != nil {
-		return "", "", err
-	}
-	sl, err := optionalString(body, "slug")
-	if err != nil || (sl != nil && !isValidSlug(*sl)) {
-		return "", "", httpError(http.StatusBadRequest, "invalid slug")
-	}
-	if t != nil {
-		transforms = *t
-	}
-	if sl != nil {
-		slug = *sl
-	}
-	return transforms, slug, nil
-}
-
-func validateVisibility(v string) error {
-	if v != "public" && v != "private" {
-		return httpError(http.StatusBadRequest, "visibility must be public or private")
-	}
-	return nil
+	return str, nil
 }
 
 func parseSeconds(raw any, maxSeconds int64) (int64, error) {

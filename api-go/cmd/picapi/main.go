@@ -14,7 +14,6 @@ import (
 	"path/filepath"
 	"strings"
 	"text/tabwriter"
-	"time"
 
 	"picapi/internal/client"
 )
@@ -23,15 +22,11 @@ const usage = `picapi: command-line client for a picapi server
 
 Usage:
   picapi login --url URL --key KEY         save and verify credentials
-  picapi upload [--private] [--name NAME] FILE...
+  picapi upload [--name NAME] FILE...
   picapi ls [--limit N] [--all]
   picapi info ID
-  picapi set ID [--name NAME] [--visibility public|private]
   picapi rm ID...
   picapi url ID [-t TRANSFORMS] [--slug SLUG] [--expires DURATION]
-  picapi share ID [-t TRANSFORMS] [--expires DURATION]
-  picapi keys [list | create NAME | revoke ID]
-  picapi reconcile [--fix]
 
 Transforms are comma-separated, e.g. w_320,f_webp or p_thumb.
 Credentials come from PICAPI_URL and PICAPI_KEY, or from the file written by login.
@@ -119,7 +114,6 @@ func run(command string, args []string) error {
 		return nil
 
 	case "upload":
-		private := fs.Bool("private", false, "upload as private")
 		name := fs.String("name", "", "filename to store (single file only)")
 		if err := parse(fs, args, 1); err != nil {
 			return err
@@ -131,12 +125,8 @@ func run(command string, args []string) error {
 		if err != nil {
 			return err
 		}
-		visibility := "public"
-		if *private {
-			visibility = "private"
-		}
 		for _, path := range fs.Args() {
-			asset, err := c.Upload(path, *name, visibility)
+			asset, err := c.Upload(path, *name)
 			if err != nil {
 				return fmt.Errorf("%s: %w", path, err)
 			}
@@ -176,9 +166,9 @@ func run(command string, args []string) error {
 			return nil
 		}
 		w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-		fmt.Fprintln(w, "ID\tVISIBILITY\tSIZE\tDIMENSIONS\tCREATED\tFILENAME")
+		fmt.Fprintln(w, "ID\tSIZE\tDIMENSIONS\tCREATED\tFILENAME")
 		for _, a := range assets {
-			fmt.Fprintf(w, "%s\t%s\t%s\t%dx%d\t%s\t%s\n", a.ID, a.Visibility, humanBytes(a.SizeBytes), a.Width, a.Height, a.CreatedAt[:10], a.Filename)
+			fmt.Fprintf(w, "%s\t%s\t%dx%d\t%s\t%s\n", a.ID, humanBytes(a.SizeBytes), a.Width, a.Height, a.CreatedAt[:10], a.Filename)
 		}
 		return w.Flush()
 
@@ -191,30 +181,6 @@ func run(command string, args []string) error {
 			return err
 		}
 		asset, err := c.Get(fs.Arg(0))
-		if err != nil {
-			return err
-		}
-		printJSON(asset)
-		return nil
-
-	case "set":
-		name := fs.String("name", "", "new filename")
-		visibility := fs.String("visibility", "", "public or private")
-		if err := parse(fs, reorder(args), 1); err != nil {
-			return err
-		}
-		fields := map[string]string{}
-		if *name != "" {
-			fields["filename"] = *name
-		}
-		if *visibility != "" {
-			fields["visibility"] = *visibility
-		}
-		c, err := loadClient()
-		if err != nil {
-			return err
-		}
-		asset, err := c.Update(fs.Arg(0), fields)
 		if err != nil {
 			return err
 		}
@@ -237,9 +203,9 @@ func run(command string, args []string) error {
 		}
 		return nil
 
-	case "url", "share":
+	case "url":
 		transforms := fs.String("t", "", "transforms, e.g. w_320,f_webp")
-		slug := fs.String("slug", "", "readable file name, e.g. photo.webp (url only)")
+		slug := fs.String("slug", "", "readable file name, e.g. photo.webp")
 		expires := fs.Duration("expires", 0, "expiry, e.g. 24h")
 		if err := parse(fs, reorder(args), 1); err != nil {
 			return err
@@ -248,105 +214,11 @@ func run(command string, args []string) error {
 		if err != nil {
 			return err
 		}
-		seconds := int64(expires.Seconds())
-		if command == "url" {
-			u, err := c.URL(fs.Arg(0), *transforms, *slug, seconds)
-			if err != nil {
-				return err
-			}
-			fmt.Println(u)
-			return nil
-		}
-		share, err := c.Share(fs.Arg(0), *transforms, seconds)
+		u, err := c.URL(fs.Arg(0), *transforms, *slug, int64(expires.Seconds()))
 		if err != nil {
 			return err
 		}
-		if *asJSON {
-			printJSON(share)
-		} else {
-			fmt.Println(share.URL)
-			fmt.Fprintln(os.Stderr, "expires", share.ExpiresAt)
-		}
-		return nil
-
-	case "keys":
-		if err := fs.Parse(args); err != nil {
-			return err
-		}
-		c, err := loadClient()
-		if err != nil {
-			return err
-		}
-		sub := fs.Arg(0)
-		switch {
-		case sub == "" || sub == "list":
-			keys, err := c.Keys()
-			if err != nil {
-				return err
-			}
-			if *asJSON {
-				printJSON(keys)
-				return nil
-			}
-			w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-			fmt.Fprintln(w, "ID\tNAME\tCREATED\tLAST USED\tSTATUS")
-			for _, k := range keys {
-				status := "active"
-				if k.RevokedAt != nil {
-					status = "revoked"
-				}
-				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", k.ID, k.Name, k.CreatedAt[:10], deref(k.LastUsed), status)
-			}
-			return w.Flush()
-		case sub == "create" && fs.NArg() == 2:
-			key, err := c.CreateKey(fs.Arg(1))
-			if err != nil {
-				return err
-			}
-			if *asJSON {
-				printJSON(key)
-				return nil
-			}
-			fmt.Println(key.Key)
-			fmt.Fprintln(os.Stderr, "Store this key now; it won't be shown again. ID:", key.ID)
-			return nil
-		case sub == "revoke" && fs.NArg() == 2:
-			if err := c.RevokeKey(fs.Arg(1)); err != nil {
-				return err
-			}
-			fmt.Println("revoked", fs.Arg(1))
-			return nil
-		}
-		return errors.New("usage: picapi keys [list | create NAME | revoke ID]")
-
-	case "reconcile":
-		fix := fs.Bool("fix", false, "delete orphans and stale rows")
-		if err := parse(fs, args, 0); err != nil {
-			return err
-		}
-		c, err := loadClient()
-		if err != nil {
-			return err
-		}
-		report, err := c.Reconcile(*fix)
-		if err != nil {
-			return err
-		}
-		if *asJSON {
-			printJSON(report)
-			return nil
-		}
-		verb := "found"
-		if report.Fixed {
-			verb = "fixed"
-		}
-		fmt.Printf("orphan originals:   %d %s\n", len(report.OrphanOriginals), verb)
-		fmt.Printf("orphan variants:    %d %s\n", len(report.OrphanVariants), verb)
-		fmt.Printf("stale variant rows: %d %s\n", len(report.StaleVariantRows), verb)
-		fmt.Printf("missing originals:  %d (cannot be fixed automatically)\n", len(report.MissingOriginals))
-		for _, id := range report.MissingOriginals {
-			fmt.Println("  missing:", id)
-		}
+		fmt.Println(u)
 		return nil
 	}
 	return fmt.Errorf("unknown command %q; run `picapi help`", command)
@@ -374,16 +246,6 @@ func reorder(args []string) []string {
 func printJSON(v any) {
 	data, _ := json.MarshalIndent(v, "", "  ")
 	fmt.Println(string(data))
-}
-
-func deref(s *string) string {
-	if s == nil {
-		return "-"
-	}
-	if t, err := time.Parse(time.RFC3339, *s); err == nil {
-		return t.Format("2006-01-02")
-	}
-	return *s
 }
 
 func humanBytes(n int64) string {

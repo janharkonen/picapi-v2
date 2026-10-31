@@ -37,7 +37,6 @@ type Asset struct {
 	Width       int    `json:"width"`
 	Height      int    `json:"height"`
 	SHA256      string `json:"sha256"`
-	Visibility  string `json:"visibility"`
 	CreatedAt   string `json:"created_at"`
 	URL         string `json:"url"`
 }
@@ -45,29 +44,6 @@ type Asset struct {
 type AssetPage struct {
 	Items      []Asset `json:"items"`
 	NextCursor *string `json:"next_cursor"`
-}
-
-type Key struct {
-	ID        string  `json:"id"`
-	Name      string  `json:"name"`
-	CreatedAt string  `json:"created_at"`
-	LastUsed  *string `json:"last_used"`
-	RevokedAt *string `json:"revoked_at"`
-	Key       string  `json:"key,omitempty"`
-}
-
-type Share struct {
-	URL       string `json:"url"`
-	Token     string `json:"token"`
-	ExpiresAt string `json:"expires_at"`
-}
-
-type ReconcileReport struct {
-	Fixed            bool     `json:"fixed"`
-	OrphanOriginals  []string `json:"orphan_originals"`
-	MissingOriginals []string `json:"missing_originals"`
-	OrphanVariants   []string `json:"orphan_variants"`
-	StaleVariantRows []string `json:"stale_variant_rows"`
 }
 
 // APIError is a non-2xx response.
@@ -131,7 +107,7 @@ func (c *Client) Session() (map[string]any, error) {
 }
 
 // Upload streams a file as multipart/form-data.
-func (c *Client) Upload(path, filename, visibility string) (*Asset, error) {
+func (c *Client) Upload(path, filename string) (*Asset, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -144,11 +120,6 @@ func (c *Client) Upload(path, filename, visibility string) (*Asset, error) {
 	form := multipart.NewWriter(pw)
 	go func() {
 		err := func() error {
-			if visibility != "" {
-				if err := form.WriteField("visibility", visibility); err != nil {
-					return err
-				}
-			}
 			part, err := form.CreateFormFile("file", filename)
 			if err != nil {
 				return err
@@ -178,11 +149,6 @@ func (c *Client) Get(id string) (*Asset, error) {
 	return &asset, c.doJSON(http.MethodGet, "/assets/"+url.PathEscape(id), nil, &asset)
 }
 
-func (c *Client) Update(id string, fields map[string]string) (*Asset, error) {
-	var asset Asset
-	return &asset, c.doJSON(http.MethodPatch, "/assets/"+url.PathEscape(id), fields, &asset)
-}
-
 func (c *Client) Delete(id string) error {
 	return c.doJSON(http.MethodDelete, "/assets/"+url.PathEscape(id), nil, nil)
 }
@@ -202,37 +168,4 @@ func (c *Client) URL(id, transforms, slug string, expiresIn int64) (string, erro
 		URL string `json:"url"`
 	}
 	return out.URL, c.doJSON(http.MethodPost, "/assets/"+url.PathEscape(id)+"/url", body, &out)
-}
-
-func (c *Client) Share(id, transforms string, expiresIn int64) (*Share, error) {
-	body := map[string]any{}
-	if transforms != "" {
-		body["transforms"] = transforms
-	}
-	if expiresIn > 0 {
-		body["expires_in"] = expiresIn
-	}
-	var out Share
-	return &out, c.doJSON(http.MethodPost, "/assets/"+url.PathEscape(id)+"/share", body, &out)
-}
-
-func (c *Client) Keys() ([]Key, error) {
-	var out struct {
-		Items []Key `json:"items"`
-	}
-	return out.Items, c.doJSON(http.MethodGet, "/keys", nil, &out)
-}
-
-func (c *Client) CreateKey(name string) (*Key, error) {
-	var out Key
-	return &out, c.doJSON(http.MethodPost, "/keys", map[string]string{"name": name}, &out)
-}
-
-func (c *Client) RevokeKey(id string) error {
-	return c.doJSON(http.MethodDelete, "/keys/"+url.PathEscape(id), nil, nil)
-}
-
-func (c *Client) Reconcile(fix bool) (*ReconcileReport, error) {
-	var out ReconcileReport
-	return &out, c.doJSON(http.MethodPost, fmt.Sprintf("/admin/reconcile?fix=%t", fix), nil, &out)
 }
