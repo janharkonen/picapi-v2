@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <title>picapi</title>
+  <rect width="64" height="64" rx="14" fill="#36b0f5"/>
+  <path fill="#fff" fill-rule="evenodd" d="M12 22a10 10 0 0 1 10-10h20a10 10 0 0 1 10 10v12a10 10 0 0 1-10 10H23v7a5.5 5.5 0 0 1-11 0zM28 17a5 5 0 0 0-5 5v12a5 5 0 0 0 5 5h14a5 5 0 0 0 5-5V22a5 5 0 0 0-5-5z"/>
+</svg>
